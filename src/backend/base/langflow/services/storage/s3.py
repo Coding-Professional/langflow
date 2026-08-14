@@ -1,4 +1,4 @@
-"""S3-based storage service implementation using async boto3.
+"""S3-based storage service implementation using aiobotocore.
 
 This service handles file storage operations with AWS S3, including
 file upload, download, deletion, and listing operations.
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 
 class S3StorageService(StorageService):
-    """A service class for handling S3 storage operations using aioboto3."""
+    """A service class for handling S3 storage operations using aiobotocore."""
 
     def __init__(self, session_service: SessionService, settings_service: SettingsService) -> None:
         """Initialize the S3 storage service with session and settings services.
@@ -32,7 +32,7 @@ class S3StorageService(StorageService):
             settings_service: The settings service instance
 
         Raises:
-            ImportError: If aioboto3 is not installed
+            ImportError: If aiobotocore is not installed
             ValueError: If required S3 configuration is missing
         """
         super().__init__(session_service, settings_service)
@@ -50,13 +50,13 @@ class S3StorageService(StorageService):
         self.tags = settings_service.settings.object_storage_tags or {}
 
         try:
-            import aioboto3
+            from aiobotocore.session import get_session
         except ImportError as exc:
-            msg = "aioboto3 is required for S3 storage. Install it with: uv pip install aioboto3"
+            msg = "aiobotocore is required for S3 storage. Install it with: uv pip install aiobotocore"
             raise ImportError(msg) from exc
 
         # Create session - AWS credentials are picked up from environment variables
-        self.session = aioboto3.Session()
+        self.session = get_session()
         self._client = None
 
         self.set_ready()
@@ -64,6 +64,39 @@ class S3StorageService(StorageService):
             f"S3 storage initialized: bucket={self.bucket_name}, prefix={self.prefix}, "
             f"region={os.getenv('AWS_DEFAULT_REGION', 'default')}"
         )
+
+    def _validate_identifiers(self, flow_id: str, file_name: str | None = None) -> None:
+        """Reject flow_id / file_name values that could escape the flow namespace.
+
+        Defense in depth at the S3 backend for GHSA-rcjh-r59h-gq37: the public-flow
+        boundary in chat.py is the primary gate, but any caller reaching this
+        backend with untrusted identifiers must still fail safely. Validation is
+        synchronous and runs before any AWS call so a malformed input cannot be
+        turned into a get_object on an arbitrary bucket key.
+        """
+        if (
+            not isinstance(flow_id, str)
+            or not flow_id
+            or "/" in flow_id
+            or "\\" in flow_id
+            or ".." in flow_id
+            or "\x00" in flow_id
+        ):
+            logger.error("Invalid flow_id contains path separators or traversal sequences")
+            msg = "Invalid flow_id: contains path separators"
+            raise ValueError(msg)
+
+        if file_name is not None and (
+            not isinstance(file_name, str)
+            or not file_name
+            or "/" in file_name
+            or "\\" in file_name
+            or ".." in file_name
+            or "\x00" in file_name
+        ):
+            logger.error("Invalid file_name contains path separators or traversal sequences")
+            msg = "Invalid file name: contains path separators"
+            raise ValueError(msg)
 
     def build_full_path(self, flow_id: str, file_name: str) -> str:
         """Build the full S3 key for a file.
@@ -124,7 +157,7 @@ class S3StorageService(StorageService):
 
     def _get_client(self):
         """Get or create an S3 client using the async context manager."""
-        return self.session.client("s3")
+        return self.session.create_client("s3")
 
     async def save_file(self, flow_id: str, file_name: str, data: bytes, *, append: bool = False) -> None:
         """Save a file to S3.
@@ -143,6 +176,7 @@ class S3StorageService(StorageService):
             msg = "Append mode is not supported for S3 storage"
             raise NotImplementedError(msg)
 
+        self._validate_identifiers(flow_id, file_name)
         key = self.build_full_path(flow_id, file_name)
 
         try:
@@ -197,6 +231,7 @@ class S3StorageService(StorageService):
         Raises:
             FileNotFoundError: If the file does not exist in S3
         """
+        self._validate_identifiers(flow_id, file_name)
         key = self.build_full_path(flow_id, file_name)
 
         try:
@@ -230,6 +265,7 @@ class S3StorageService(StorageService):
         Raises:
             FileNotFoundError: If the file does not exist in S3
         """
+        self._validate_identifiers(flow_id, file_name)
         key = self.build_full_path(flow_id, file_name)
 
         try:
@@ -266,8 +302,7 @@ class S3StorageService(StorageService):
         Raises:
             Exception: If there's an error listing files from S3
         """
-        if not isinstance(flow_id, str):
-            flow_id = str(flow_id)
+        self._validate_identifiers(flow_id)
 
         prefix = self.build_full_path(flow_id, "")
 
@@ -302,6 +337,7 @@ class S3StorageService(StorageService):
         Note:
             S3 delete_object doesn't raise an error if the object doesn't exist
         """
+        self._validate_identifiers(flow_id, file_name)
         key = self.build_full_path(flow_id, file_name)
 
         try:
@@ -325,6 +361,7 @@ class S3StorageService(StorageService):
         Raises:
             FileNotFoundError: If the file does not exist in S3
         """
+        self._validate_identifiers(flow_id, file_name)
         key = self.build_full_path(flow_id, file_name)
 
         try:
@@ -347,7 +384,7 @@ class S3StorageService(StorageService):
     async def teardown(self) -> None:
         """Perform any cleanup operations when the service is being torn down.
 
-        For S3, we don't need to do anything as aioboto3 handles cleanup
+        For S3, we don't need to do anything as aiobotocore handles cleanup
         via context managers.
         """
         logger.info("S3 storage service teardown complete")

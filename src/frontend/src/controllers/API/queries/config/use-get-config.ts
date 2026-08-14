@@ -21,6 +21,8 @@ interface BaseConfig {
   voice_mode_available: boolean;
   allow_custom_components: boolean;
   mcp_base_url: string;
+  // Runtime mirror of LANGFLOW_ENABLE_EXTENSION_RELOAD — see utilityStore.enableExtensionReload.
+  enable_extension_reload: boolean;
 }
 
 // Public config = base config (unauthenticated users get only base fields)
@@ -37,6 +39,15 @@ export interface ConfigResponse extends BaseConfig {
   webhook_auth_enable: boolean;
   default_folder_name: string;
   hide_getting_started_progress: boolean;
+  embedded_mode: boolean;
+  hide_logout_button: boolean;
+  hide_new_project_button: boolean;
+  hide_new_flow_button: boolean;
+  hide_starter_projects: boolean;
+  mcp_servers_locked: boolean;
+  custom_component_admin_only: boolean;
+  a2a_enabled: boolean;
+  agentic_experience: boolean;
 }
 
 // Union type for the response (can be either public or full config)
@@ -84,13 +95,38 @@ export const useGetConfig: useQueryFunctionType<
     (state) => state.setAllowCustomComponents,
   );
   const setMcpBaseUrl = useUtilityStore((state) => state.setMcpBaseUrl);
+  const setEnableExtensionReload = useUtilityStore(
+    (state) => state.setEnableExtensionReload,
+  );
+  const setEmbeddedMode = useUtilityStore((state) => state.setEmbeddedMode);
+  const setHideLogoutButton = useUtilityStore(
+    (state) => state.setHideLogoutButton,
+  );
+  const setHideNewProjectButton = useUtilityStore(
+    (state) => state.setHideNewProjectButton,
+  );
+  const setHideNewFlowButton = useUtilityStore(
+    (state) => state.setHideNewFlowButton,
+  );
+  const setHideStarterProjects = useUtilityStore(
+    (state) => state.setHideStarterProjects,
+  );
+  const setMcpServersLocked = useUtilityStore(
+    (state) => state.setMcpServersLocked,
+  );
+  const setCustomComponentAdminOnly = useUtilityStore(
+    (state) => state.setCustomComponentAdminOnly,
+  );
+  const setA2aEnabled = useUtilityStore((state) => state.setA2aEnabled);
+  const setAgenticExperienceEnabled = useUtilityStore(
+    (state) => state.setAgenticExperienceEnabled,
+  );
 
   const { query } = UseRequestProcessor();
 
   const getConfigFn = async () => {
-    // The /config endpoint returns different responses based on authentication:
-    // - Authenticated: Full ConfigResponse with all settings
-    // - Unauthenticated: PublicConfigResponse with limited settings
+    // Authenticated requests get the full ConfigResponse; unauthenticated ones
+    // get the limited PublicConfigResponse.
     const response = await api.get<ConfigResponseType>(`${getURL("CONFIG")}`);
     const data = response["data"];
     if (data) {
@@ -103,10 +139,11 @@ export const useGetConfig: useQueryFunctionType<
 
       // Set fields present in both public and full config
       setMaxFileSizeUpload(data.max_file_size_upload);
-      setEventDelivery(data.event_delivery ?? EventDeliveryType.POLLING);
+      setEventDelivery(data.event_delivery ?? EventDeliveryType.STREAMING);
       const allowCustomComponents = data.allow_custom_components ?? true;
       setAllowCustomComponents(allowCustomComponents);
       setMcpBaseUrl(data.mcp_base_url ?? "");
+      setEnableExtensionReload(Boolean(data.enable_extension_reload));
       recomputeComponentsToUpdateIfNeeded();
 
       // Set authenticated-only fields if present (full config)
@@ -124,6 +161,16 @@ export const useGetConfig: useQueryFunctionType<
         setHideGettingStartedProgress(
           data.hide_getting_started_progress ?? false,
         );
+        // Embedded mode flags
+        setEmbeddedMode(data.embedded_mode ?? false);
+        setHideLogoutButton(data.hide_logout_button ?? false);
+        setHideNewProjectButton(data.hide_new_project_button ?? false);
+        setHideNewFlowButton(data.hide_new_flow_button ?? false);
+        setHideStarterProjects(data.hide_starter_projects ?? false);
+        setMcpServersLocked(data.mcp_servers_locked ?? false);
+        setCustomComponentAdminOnly(data.custom_component_admin_only ?? false);
+        setA2aEnabled(data.a2a_enabled ?? false);
+        setAgenticExperienceEnabled(data.agentic_experience ?? true);
       }
     }
     return data;

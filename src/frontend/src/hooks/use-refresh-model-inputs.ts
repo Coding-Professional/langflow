@@ -2,8 +2,12 @@ import { QueryClient, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef } from "react";
 import { api } from "@/controllers/API/api";
 import { getURL } from "@/controllers/API/helpers/constants";
+import {
+  getModelProvidersQueryOptions,
+  type ModelProviderWithStatus,
+} from "@/controllers/API/queries/models/use-get-model-providers";
 import useAlertStore from "@/stores/alertStore";
-import useFlowStore from "@/stores/flowStore";
+import useFlowStore, { syncNodeTranslations } from "@/stores/flowStore";
 import useFlowsManagerStore from "@/stores/flowsManagerStore";
 import { useUtilityStore } from "@/stores/utilityStore";
 import type {
@@ -16,10 +20,13 @@ import {
   isCustomComponentBlockError,
   isNodeOutdated,
 } from "@/utils/customComponentGuards";
+import i18n from "../i18n";
 
 export interface RefreshOptions {
   silent?: boolean;
 }
+
+type ProviderConfiguration = ReadonlyMap<string, boolean>;
 
 // Prevents concurrent refresh operations; queues the latest request if busy
 let isRefreshInProgress = false;
@@ -34,6 +41,7 @@ export function isModelNode(node: AllNodeType): boolean {
   const template = node.data?.node?.template;
   if (!template) return false;
 
+  // biome-ignore lint/suspicious/noExplicitAny: legacy
   return Object.values(template).some((field: any) => field?.type === "model");
 }
 
@@ -49,6 +57,7 @@ export function buildRefreshPayload(
   template: APITemplateType,
   flowId: string | undefined,
   folderId: string | undefined,
+  // biome-ignore lint/suspicious/noExplicitAny: legacy
 ): Record<string, any> {
   return {
     ...template,
@@ -111,26 +120,48 @@ export async function refreshAllModelInputs(
 
     if (nodesWithModelFields.length === 0) {
       if (showNotifications) {
-        setSuccessData({ title: "No model components to refresh" });
+        // biome-ignore lint/suspicious/noExplicitAny: legacy
+        setSuccessData({ title: (i18n as any).t("errors.noModelsToRefresh") });
       }
       return;
     }
 
+    let providerConfiguration: ProviderConfiguration | undefined;
+    if (queryClient) {
+      try {
+        const providers = await queryClient.fetchQuery(
+          getModelProvidersQueryOptions({}),
+        );
+        providerConfiguration = buildProviderConfiguration(providers);
+      } catch {
+        // A failed refetch may leave stale catalog data in React Query. Treat
+        // provider status as unknown so refresh never overwrites a saved model
+        // based on stale configuration state.
+        providerConfiguration = undefined;
+      }
+    }
+
     const refreshTasks = nodesWithModelFields.map((node) =>
-      refreshSingleNode(node, flowId, folderId, setNode),
+      refreshSingleNode(node, flowId, folderId, setNode, providerConfiguration),
     );
     await Promise.all(refreshTasks);
 
+    // Re-apply translations after refresh overwrites output display_names
+    syncNodeTranslations();
+
     if (showNotifications) {
       const count = nodesWithModelFields.length;
-      const plural = count > 1 ? "s" : "";
-      setSuccessData({ title: `Refreshed ${count} model component${plural}` });
+      setSuccessData({
+        // biome-ignore lint/suspicious/noExplicitAny: legacy
+        title: (i18n as any).t("alerts.modelsRefreshed", { count }),
+      });
     }
   } catch (error) {
     console.error("Error refreshing model inputs:", error);
     if (showNotifications) {
       setErrorData({
-        title: "Error refreshing model components",
+        // biome-ignore lint/suspicious/noExplicitAny: legacy
+        title: (i18n as any).t("errors.refreshingModels"),
         list: [(error as Error)?.message || "An unexpected error occurred"],
       });
     }
@@ -145,10 +176,23 @@ export async function refreshAllModelInputs(
   }
 }
 
+function buildProviderConfiguration(
+  providers: ModelProviderWithStatus[],
+): ProviderConfiguration {
+  return new Map(
+    providers.flatMap((provider) =>
+      typeof provider.is_configured === "boolean"
+        ? [[provider.provider, provider.is_configured] as const]
+        : [],
+    ),
+  );
+}
+
 /** Validates and corrects model value against available options */
 function validateModelValue(
   template: APITemplateType,
   modelFieldKey: string,
+  providerConfiguration?: ProviderConfiguration,
 ): APITemplateType {
   const modelField = template[modelFieldKey];
   if (!modelField) return template;
@@ -161,16 +205,34 @@ function validateModelValue(
     (opt: ModelOptionType) => !opt?.metadata?.is_disabled_provider,
   );
 
-  // Get current model name from value
-  const currentModelName = Array.isArray(currentValue)
-    ? currentValue[0]?.name
-    : currentValue?.name;
+  const currentModel = Array.isArray(currentValue)
+    ? currentValue[0]
+    : currentValue;
+  const currentModelName = currentModel?.name;
+  const currentProvider = currentModel?.provider;
+  const currentProviderConfiguration = currentProvider
+    ? providerConfiguration?.get(currentProvider)
+    : undefined;
 
-  // Check if current model is still available
+  // Sticky-defaults can mean either a disconnected provider or a configured
+  // provider whose valid model is not locally enabled. Only reject them when
+  // the refreshed provider catalog explicitly says the provider is disconnected.
+  const selectableOptions = availableOptions.filter(
+    (opt: ModelOptionType) =>
+      opt?.metadata?.not_enabled_locally !== true &&
+      (!opt.provider || providerConfiguration?.get(opt.provider) !== false),
+  );
+  const optionsForValidation =
+    currentProviderConfiguration === false && selectableOptions.length > 0
+      ? selectableOptions
+      : availableOptions;
+
   const isCurrentModelValid =
     currentModelName &&
-    availableOptions.some(
-      (opt: ModelOptionType) => opt.name === currentModelName,
+    optionsForValidation.some(
+      (opt: ModelOptionType) =>
+        opt.name === currentModelName &&
+        (!currentProvider || opt.provider === currentProvider),
     );
 
   if (isCurrentModelValid) {
@@ -179,9 +241,8 @@ function validateModelValue(
   }
 
   // Current value is invalid - need to update it
-  if (availableOptions.length > 0) {
-    // Select the first available model
-    const firstOption = availableOptions[0];
+  if (optionsForValidation.length > 0) {
+    const firstOption = optionsForValidation[0];
     const newValue = [
       {
         ...(firstOption.id && { id: firstOption.id }),
@@ -216,6 +277,7 @@ async function refreshSingleNode(
   flowId: string | undefined,
   folderId: string | undefined,
   setNode: ReturnType<typeof useFlowStore.getState>["setNode"],
+  providerConfiguration?: ProviderConfiguration,
 ): Promise<void> {
   const nodeData = node.data?.node as APIClassType | undefined;
   if (!nodeData?.template) return;
@@ -255,6 +317,7 @@ async function refreshSingleNode(
           tool_mode: nodeData.tool_mode,
         },
       );
+      // biome-ignore lint/suspicious/noExplicitAny: legacy
     } catch (e: any) {
       // Suppress 403 specifically from custom component blocking — fallback
       // for race conditions where guards above couldn't detect the outdated
@@ -276,6 +339,7 @@ async function refreshSingleNode(
     const validatedTemplate = validateModelValue(
       responseData.template,
       modelFieldKey,
+      providerConfiguration,
     );
 
     setNode(

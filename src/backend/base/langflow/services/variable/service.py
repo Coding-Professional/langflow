@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from lfx.services.settings.service import SettingsService
+    from pydantic import SecretStr
     from sqlmodel.ext.asyncio.session import AsyncSession
 
 
@@ -30,23 +31,19 @@ class DatabaseVariableService(VariableService, Service):
             await logger.adebug("Skipping environment variable storage.")
             return
 
-        # Import the provider mapping to set default_fields for known providers
+        # Import provider metadata to identify placeholder API-key values.
         try:
             from lfx.base.models.unified_models import get_model_provider_metadata
 
-            # Build var_to_provider from all variables in metadata (not just primary)
-            var_to_provider = {}
-            var_to_info = {}  # Maps variable_key to its full info (including is_secret)
+            provider_variables = {}
             metadata = get_model_provider_metadata()
-            for provider, meta in metadata.items():
+            for meta in metadata.values():
                 for var in meta.get("variables", []):
                     var_key = var.get("variable_key")
                     if var_key:
-                        var_to_provider[var_key] = provider
-                        var_to_info[var_key] = var
+                        provider_variables[var_key] = var
         except Exception:  # noqa: BLE001
-            var_to_provider = {}
-            var_to_info = {}
+            provider_variables = {}
 
         for var_name in self.settings_service.settings.variables_to_get_from_environment:
             # Check if session is still usable before processing each variable
@@ -62,8 +59,8 @@ class DatabaseVariableService(VariableService, Service):
 
                 # Skip placeholder/test values like "dummy" for API key variables only
                 # This prevents test environments from overwriting user-configured model provider keys
-                is_provider_variable = var_name in var_to_provider
-                var_info = var_to_info.get(var_name, {})
+                var_info = provider_variables.get(var_name, {})
+                is_provider_variable = bool(var_info)
                 is_secret_variable = var_info.get("is_secret", False)
 
                 if is_provider_variable and is_secret_variable and value.lower() == "dummy":
@@ -74,35 +71,7 @@ class DatabaseVariableService(VariableService, Service):
                     continue
 
                 query = select(Variable).where(Variable.user_id == user_id, Variable.name == var_name)
-                # Set default_fields if this is a known provider variable
-                default_fields = []
                 try:
-                    if is_provider_variable:
-                        provider_name = var_to_provider[var_name]
-                        # Get the variable type from metadata
-                        var_display_name = var_info.get("variable_name", "api_key")
-
-                        # Validate secret variables (API keys) before setting default_fields
-                        # This prevents invalid keys from enabling providers during migration
-                        if is_secret_variable:
-                            try:
-                                from lfx.base.models.unified_models import validate_model_provider_key
-
-                                validate_model_provider_key(provider_name, {var_name: value})
-                                # Only set default_fields if validation passes
-                                default_fields = [provider_name, var_display_name]
-                                await logger.adebug(f"Validated {var_name} - provider will be enabled")
-                            except (ValueError, Exception) as validation_error:  # noqa: BLE001
-                                # Validation failed - don't set default_fields
-                                # This prevents the provider from appearing as "Enabled"
-                                default_fields = []
-                                await logger.adebug(
-                                    f"Skipping default_fields for {var_name} - validation failed: {validation_error!s}"
-                                )
-                        else:
-                            # Non-secret variables (like project_id, url) don't need validation
-                            default_fields = [provider_name, var_display_name]
-                            await logger.adebug(f"Set default_fields for non-secret variable {var_name}")
                     existing = (await session.exec(query)).first()
                 except Exception as e:  # noqa: BLE001
                     await logger.aexception(f"Error querying {var_name} variable: {e!s}")
@@ -125,35 +94,8 @@ class DatabaseVariableService(VariableService, Service):
                         )
 
                         if is_user_modified:
-                            # Variable was modified by user, don't overwrite with environment variable
-                            # Only update default_fields if they're not set
-                            if not existing.default_fields and default_fields:
-                                variable_update = VariableUpdate(
-                                    id=existing.id,
-                                    default_fields=default_fields,
-                                )
-                                await self.update_variable_fields(
-                                    user_id=user_id,
-                                    variable_id=existing.id,
-                                    variable=variable_update,
-                                    session=session,
-                                )
                             await logger.adebug(
                                 f"Skipping update of user-modified variable {var_name} with environment value"
-                            )
-                        # Variable was not user-modified, safe to update from environment
-                        elif not existing.default_fields and default_fields:
-                            # Update both value and default_fields
-                            variable_update = VariableUpdate(
-                                id=existing.id,
-                                value=value,
-                                default_fields=default_fields,
-                            )
-                            await self.update_variable_fields(
-                                user_id=user_id,
-                                variable_id=existing.id,
-                                variable=variable_update,
-                                session=session,
                             )
                         else:
                             await self.update_variable(user_id, var_name, value, session=session)
@@ -162,7 +104,8 @@ class DatabaseVariableService(VariableService, Service):
                             user_id=user_id,
                             name=var_name,
                             value=value,
-                            default_fields=default_fields,
+                            # Model Providers resolve these at runtime; Apply To Fields is user-owned.
+                            default_fields=[],
                             type_=CREDENTIAL_TYPE,
                             session=session,
                         )
@@ -198,7 +141,7 @@ class DatabaseVariableService(VariableService, Service):
         name: str,
         field: str,
         session: AsyncSession,
-    ) -> str:
+    ) -> str | SecretStr:
         # we get the credential from the database
         # credential = session.query(Variable).filter(Variable.user_id == user_id, Variable.name == name).first()
         variable = await self.get_variable_object(user_id, name, session)
@@ -210,9 +153,23 @@ class DatabaseVariableService(VariableService, Service):
             )
             raise TypeError(msg)
 
-        # Only decrypt CREDENTIAL type variables; GENERIC variables are stored as plain text
+        # Only decrypt CREDENTIAL type variables; GENERIC variables are stored as plain text.
+        # CREDENTIAL values are wrapped in pydantic.SecretStr so that any consumer that echoes
+        # the value through a stringification path (Message.text, status, traces, logs) gets
+        # "**********" instead of the raw secret. Consumers that genuinely need the raw value
+        # call .get_secret_value() at the boundary (e.g. provider client construction).
         if variable.type == CREDENTIAL_TYPE:
-            return auth_utils.decrypt_api_key(variable.value)
+            from pydantic import SecretStr
+
+            decrypted = auth_utils.decrypt_api_key(variable.value)
+            if not decrypted:
+                msg = (
+                    f"Could not decrypt credential variable '{name}'. The stored value cannot be "
+                    "decrypted with the current LANGFLOW_SECRET_KEY — it may have been encrypted "
+                    "with a different key."
+                )
+                raise ValueError(msg)
+            return SecretStr(decrypted)
         # GENERIC type - return as-is
         return variable.value
 
@@ -223,9 +180,26 @@ class DatabaseVariableService(VariableService, Service):
         for variable in variables:
             value = None
             if variable.type == GENERIC_TYPE:
+                if not variable.value:
+                    await logger.awarning("Variable '%s' has no stored value — skipping.", variable.name)
+                    continue
+                # Security defense-in-depth: a GENERIC variable is stored as plain text, so its
+                # value must never be a Fernet token. If it is (e.g. a CREDENTIAL row that was
+                # relabeled GENERIC), do NOT decrypt-and-return it — that would leak the secret.
+                if isinstance(variable.value, str) and variable.value.startswith("gAAAAA"):
+                    await logger.awarning(
+                        "Skipping variable '%s': a GENERIC variable holds ciphertext "
+                        "(likely a CREDENTIAL row relabeled GENERIC); not decrypting or returning it.",
+                        variable.name,
+                    )
+                    continue
                 value = auth_utils.decrypt_api_key(variable.value)
                 if not value:
-                    # If decryption fails (likely due to encryption by different key), skip this variable
+                    await logger.awarning(
+                        "Variable '%s' could not be decrypted — likely encrypted with a different "
+                        "LANGFLOW_SECRET_KEY. Skipping.",
+                        variable.name,
+                    )
                     continue
 
             # Model validate will set value to None if credential type
@@ -330,7 +304,21 @@ class DatabaseVariableService(VariableService, Service):
     ):
         query = select(Variable).where(Variable.id == variable_id, Variable.user_id == user_id)
         db_variable = (await session.exec(query)).one()
-        db_variable.updated_at = datetime.now(timezone.utc)
+
+        # Security: prevent a CREDENTIAL -> GENERIC type-confusion that would expose the
+        # decrypted secret. Credential values are stored as Fernet ciphertext ("gAAAAA...").
+        # Relabeling the row GENERIC *without* supplying a fresh value would leave that
+        # ciphertext in place; get_all() then decrypts GENERIC values and returns the
+        # plaintext (e.g. the server's shared provider keys). Reject that transition.
+        resulting_type = variable.type if variable.type is not None else db_variable.type
+        if (
+            resulting_type == GENERIC_TYPE
+            and variable.value is None
+            and isinstance(db_variable.value, str)
+            and db_variable.value.startswith("gAAAAA")
+        ):
+            msg = "Cannot change a credential variable to a generic variable without providing a new value."
+            raise ValueError(msg)
 
         # Handle value encryption based on variable type (consistent with update_variable and create_variable)
         if variable.value is not None:
@@ -349,6 +337,7 @@ class DatabaseVariableService(VariableService, Service):
                 variable.value = auth_utils.encrypt_api_key(variable.value, settings_service=self.settings_service)
             # GENERIC_TYPE variables are stored as plain text
 
+        db_variable.updated_at = datetime.now(timezone.utc)
         variable_data = variable.model_dump(exclude_unset=True)
         for key, value in variable_data.items():
             setattr(db_variable, key, value)

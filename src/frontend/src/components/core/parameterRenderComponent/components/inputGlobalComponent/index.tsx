@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { useGetGlobalVariables } from "@/controllers/API/queries/variables";
 import GeneralDeleteConfirmationModal from "@/shared/components/delete-confirmation-modal";
 import { cn } from "../../../../../utils/utils";
@@ -15,20 +16,32 @@ import {
 } from "./hooks";
 import type { GlobalVariable, GlobalVariableHandlers } from "./types";
 
+// Pydantic input classes that intrinsically represent secret fields. Only
+// fields of these types should accept Credential-typed global variables. The
+// dynamic `password` flag isn't sufficient on its own — components like
+// TextInput's `use_global_variable` toggle flip `password=true` for display
+// masking on a field whose intrinsic type (MultilineInput) is non-secret.
+const SECRET_INPUT_TYPES = new Set(["SecretStrInput", "MultilineSecretInput"]);
+
 export default function InputGlobalComponent({
   display_name,
   disabled,
   handleOnNewValue,
   value,
   id,
+  nodeId,
   load_from_db,
   password,
+  _input_type,
   editNode = false,
   placeholder,
   isToolMode = false,
   hasRefreshButton = false,
   showParameter = true,
-}: InputProps<string, InputGlobalComponentType>): JSX.Element | null {
+}: InputProps<string, InputGlobalComponentType> & {
+  _input_type?: string;
+}): JSX.Element | null {
+  const { t } = useTranslation();
   const {
     data: globalVariables,
     isFetchedAfterMount: isGlobalVariablesFetchedAfterMount,
@@ -127,7 +140,7 @@ export default function InputGlobalComponent({
           className={cn("mr-2 h-4 w-4 text-primary")}
           aria-hidden="true"
         />
-        <span>Add New Variable</span>
+        <span>{t("input.addNewVariable")}</span>
       </CommandItem>
     </GlobalVariableModal>
   );
@@ -151,6 +164,25 @@ export default function InputGlobalComponent({
     variableOptions = [...variableOptions, currentValue];
   }
 
+  // Disable Credential-typed variables unless this is a true secret field
+  // (SecretStrInput / MultilineSecretInput by intrinsic class). Falls back to
+  // the dynamic `password` flag when the backend hasn't supplied `_input_type`.
+  // Rule mirrors the backend validator's intent: credentials shouldn't flow
+  // into fields whose values render in Message.text/status/traces.
+  const isSecretField = _input_type
+    ? SECRET_INPUT_TYPES.has(_input_type)
+    : (password ?? false);
+  const disabledOptions: Record<string, string> = isSecretField
+    ? {}
+    : Object.fromEntries(
+        typedGlobalVariables
+          .filter((v) => v.type === "Credential")
+          .map((v) => [
+            v.name,
+            "Credential variables can only be used in secret fields (API keys, tokens). Select a Generic-typed variable, or change this variable's type to Generic if it isn't sensitive.",
+          ]),
+      );
+
   const selectedOption = loadFromDb ? currentValue : "";
 
   if (!showParameter) {
@@ -163,12 +195,14 @@ export default function InputGlobalComponent({
       popoverWidth="17.5rem"
       placeholder={getPlaceholder(disabled, placeholder)}
       id={id}
+      nodeId={nodeId}
       editNode={editNode}
       disabled={disabled}
       password={password ?? false}
       value={currentValue}
       options={variableOptions}
-      optionsPlaceholder="Global Variables"
+      disabledOptions={disabledOptions}
+      optionsPlaceholder={t("globalVars.pageTitle")}
       optionsIcon="Globe"
       optionsButton={renderAddVariableButton()}
       optionButton={renderDeleteButton}

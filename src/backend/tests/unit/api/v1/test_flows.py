@@ -36,7 +36,7 @@ async def _attach_deployment_to_flow(*, user_id: UUID, flow_id: UUID, project_id
             project_id=project_id,
             deployment_provider_account_id=provider.id,
             resource_key=f"rk-{flow_id.hex[:8]}",
-            name=f"deployment-{flow_id.hex[:8]}",
+            display_name=f"deployment-{flow_id.hex[:8]}",
             deployment_type=DeploymentType.AGENT,
         )
         session.add(deployment)
@@ -207,6 +207,87 @@ async def test_update_flow(client: AsyncClient, logged_in_headers):
     assert result["name"] == updated_name, "The name must be updated"
 
 
+async def test_locked_flow_rejects_api_updates_until_unlocked(client: AsyncClient, logged_in_headers):
+    original_data = {"nodes": [], "edges": []}
+    create_response = await client.post(
+        "api/v1/flows/",
+        json={"name": "locked-flow", "description": "original", "data": original_data, "locked": True},
+        headers=logged_in_headers,
+    )
+    assert create_response.status_code == status.HTTP_201_CREATED
+    created = create_response.json()
+    flow_id = created["id"]
+
+    # Navigation can submit the full current flow even when nothing changed.
+    # A no-op save must succeed so the UI can leave a locked flow cleanly.
+    no_op_response = await client.patch(
+        f"api/v1/flows/{flow_id}",
+        json={
+            "name": created["name"],
+            "description": created["description"],
+            "data": created["data"],
+            "folder_id": created["folder_id"],
+            "endpoint_name": created["endpoint_name"],
+            "locked": True,
+        },
+        headers=logged_in_headers,
+    )
+    assert no_op_response.status_code == status.HTTP_200_OK
+    assert no_op_response.json()["locked"] is True
+
+    patch_response = await client.patch(
+        f"api/v1/flows/{flow_id}",
+        json={"description": "changed via PATCH"},
+        headers=logged_in_headers,
+    )
+    assert patch_response.status_code == status.HTTP_423_LOCKED
+    assert patch_response.json()["detail"] == "Flow is locked. Unlock it before making changes."
+
+    put_response = await client.put(
+        f"api/v1/flows/{flow_id}",
+        json={"name": "changed-via-put", "description": "original", "data": original_data},
+        headers=logged_in_headers,
+    )
+    assert put_response.status_code == status.HTTP_423_LOCKED
+
+    combined_unlock_response = await client.patch(
+        f"api/v1/flows/{flow_id}",
+        json={"locked": False, "description": "changed while unlocking"},
+        headers=logged_in_headers,
+    )
+    assert combined_unlock_response.status_code == status.HTTP_423_LOCKED
+
+    unchanged_response = await client.get(f"api/v1/flows/{flow_id}", headers=logged_in_headers)
+    assert unchanged_response.status_code == status.HTTP_200_OK
+    assert unchanged_response.json()["name"] == "locked-flow"
+    assert unchanged_response.json()["description"] == "original"
+
+    # The UI sends the current flow fields along with the lock toggle. Equal
+    # values must not prevent an unlock-only request from succeeding.
+    unlock_response = await client.patch(
+        f"api/v1/flows/{flow_id}",
+        json={
+            "name": created["name"],
+            "description": created["description"],
+            "data": created["data"],
+            "folder_id": created["folder_id"],
+            "endpoint_name": created["endpoint_name"],
+            "locked": False,
+        },
+        headers=logged_in_headers,
+    )
+    assert unlock_response.status_code == status.HTTP_200_OK
+    assert unlock_response.json()["locked"] is False
+
+    update_response = await client.patch(
+        f"api/v1/flows/{flow_id}",
+        json={"description": "changed after unlock"},
+        headers=logged_in_headers,
+    )
+    assert update_response.status_code == status.HTTP_200_OK
+    assert update_response.json()["description"] == "changed after unlock"
+
+
 async def test_patch_flow_keeps_existing_endpoint_when_not_provided(client: AsyncClient, logged_in_headers):
     """Test that PATCH preserves endpoint_name when the field is omitted."""
     initial_flow = {
@@ -274,6 +355,146 @@ async def test_patch_flow_updates_access_and_action_fields(client: AsyncClient, 
     assert result["access_type"] == "PUBLIC"
     assert result["action_name"] == "shared_action"
     assert result["action_description"] == "Shared flow action"
+
+
+async def test_create_flow_defaults_to_workflow_type(client: AsyncClient, logged_in_headers):
+    """A flow created without flow_type is a workflow with A2A off."""
+    response = await client.post(
+        "api/v1/flows/",
+        json={"name": "default_type_flow", "data": {}},
+        headers=logged_in_headers,
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    result = response.json()
+    assert result["flow_type"] == "workflow"
+    assert result["a2a_enabled"] is False
+    assert result["a2a_card_overrides"] is None
+
+
+async def test_create_agent_flow_round_trips(client: AsyncClient, logged_in_headers):
+    """flow_type=agent and the a2a fields persist through create and read."""
+    create_response = await client.post(
+        "api/v1/flows/",
+        json={
+            "name": "agent_flow",
+            "data": {},
+            "flow_type": "agent",
+            "a2a_enabled": True,
+            "a2a_card_overrides": {"skill_description": "does things"},
+        },
+        headers=logged_in_headers,
+    )
+    assert create_response.status_code == status.HTTP_201_CREATED
+    created = create_response.json()
+    assert created["flow_type"] == "agent"
+    assert created["a2a_enabled"] is True
+
+    flow_id = created["id"]
+    read_response = await client.get(f"api/v1/flows/{flow_id}", headers=logged_in_headers)
+    assert read_response.status_code == status.HTTP_200_OK
+    read = read_response.json()
+    assert read["flow_type"] == "agent"
+    assert read["a2a_enabled"] is True
+    assert read["a2a_card_overrides"] == {"skill_description": "does things"}
+
+
+async def test_patch_flow_updates_flow_type_and_a2a(client: AsyncClient, logged_in_headers):
+    """PATCH can promote a workflow to an agent and set the a2a fields."""
+    create_response = await client.post(
+        "api/v1/flows/",
+        json={"name": "patch_flow_type_flow", "data": {}},
+        headers=logged_in_headers,
+    )
+    assert create_response.status_code == status.HTTP_201_CREATED
+    flow_id = create_response.json()["id"]
+
+    response = await client.patch(
+        f"api/v1/flows/{flow_id}",
+        json={"flow_type": "agent", "a2a_enabled": True, "a2a_card_overrides": {"tags": ["x"]}},
+        headers=logged_in_headers,
+    )
+    assert response.status_code == status.HTTP_200_OK
+    result = response.json()
+    assert result["flow_type"] == "agent"
+    assert result["a2a_enabled"] is True
+    assert result["a2a_card_overrides"] == {"tags": ["x"]}
+
+
+async def test_read_flows_filtered_by_flow_type(client: AsyncClient, logged_in_headers):
+    """The list endpoint filtered by flow_type=agent returns only agent flows."""
+    workflow_response = await client.post(
+        "api/v1/flows/",
+        json={"name": "a_workflow_flow", "data": {}},
+        headers=logged_in_headers,
+    )
+    agent_response = await client.post(
+        "api/v1/flows/",
+        json={"name": "an_agent_flow", "data": {}, "flow_type": "agent"},
+        headers=logged_in_headers,
+    )
+    workflow_id = workflow_response.json()["id"]
+    agent_id = agent_response.json()["id"]
+
+    response = await client.get(
+        "api/v1/flows/",
+        params={"get_all": True, "flow_type": "agent"},
+        headers=logged_in_headers,
+    )
+    assert response.status_code == status.HTTP_200_OK
+    result = response.json()
+    returned_ids = {flow["id"] for flow in result}
+    assert agent_id in returned_ids
+    assert workflow_id not in returned_ids
+    assert all(flow["flow_type"] == "agent" for flow in result)
+
+
+async def test_create_agent_flow_defaults_a2a_disabled(client: AsyncClient, logged_in_headers):
+    """Creating an agent flow without a2a_enabled leaves A2A off by default."""
+    response = await client.post(
+        "api/v1/flows/",
+        json={"name": "agent_no_a2a_flow", "data": {}, "flow_type": "agent"},
+        headers=logged_in_headers,
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    result = response.json()
+    assert result["flow_type"] == "agent"
+    assert result["a2a_enabled"] is False
+
+
+async def test_read_flows_rejects_invalid_flow_type(client: AsyncClient, logged_in_headers):
+    """An unknown flow_type query value is rejected by enum validation."""
+    response = await client.get(
+        "api/v1/flows/",
+        params={"get_all": True, "flow_type": "not_a_real_type"},
+        headers=logged_in_headers,
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
+async def test_read_flows_header_mode_filtered_by_flow_type(client: AsyncClient, logged_in_headers):
+    """The flow_type filter also applies on the header_flows (compressed) list path."""
+    await client.post(
+        "api/v1/flows/",
+        json={"name": "header_workflow_flow", "data": {}},
+        headers=logged_in_headers,
+    )
+    agent_response = await client.post(
+        "api/v1/flows/",
+        json={"name": "header_agent_flow", "data": {}, "flow_type": "agent"},
+        headers=logged_in_headers,
+    )
+    agent_id = agent_response.json()["id"]
+
+    response = await client.get(
+        "api/v1/flows/",
+        params={"get_all": True, "header_flows": True, "flow_type": "agent"},
+        headers=logged_in_headers,
+    )
+    assert response.status_code == status.HTTP_200_OK
+    result = response.json()
+    returned_ids = {flow["id"] for flow in result}
+    assert agent_id in returned_ids
+    assert all(flow["flow_type"] == "agent" for flow in result)
 
 
 async def test_create_flows(client: AsyncClient, logged_in_headers):
@@ -646,6 +867,87 @@ async def test_create_flow_rejects_traversal_in_subpath(client: AsyncClient, log
     }
     response = await client.post("api/v1/flows/", json=basic_case, headers=logged_in_headers)
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+async def test_upload_flow_rejects_list_payload(client: AsyncClient, logged_in_headers):
+    """Regression: uploading a JSON array (not an object) must return 422, not 500.
+
+    orjson.loads() on a list payload returns a Python list.  Before the isinstance
+    guard, 'flows' in <list> silently evaluates to False, routing to the else branch
+    where **normalize_code_for_import(list) raises TypeError — escaping as a 500.
+    """
+    import json
+
+    file_content = json.dumps([{"name": "flow1", "data": {}}])
+
+    response = await client.post(
+        "api/v1/flows/upload/",
+        files={"file": ("flows.json", file_content, "application/json")},
+        headers=logged_in_headers,
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
+async def test_upload_flow_rejects_scalar_payload(client: AsyncClient, logged_in_headers):
+    """Regression: uploading a JSON scalar (string/number) must return 422, not 500."""
+    import json
+
+    file_content = json.dumps("just a string")
+
+    response = await client.post(
+        "api/v1/flows/upload/",
+        files={"file": ("flows.json", file_content, "application/json")},
+        headers=logged_in_headers,
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
+async def test_upload_flow_rejects_endpoint_name_with_dots(client: AsyncClient, logged_in_headers):
+    """Regression: endpoint_name containing dots must return 422, not 500.
+
+    Previously a ValidationError from the Pydantic model escaped the handler
+    and hit the global exception_handler, producing a 500 and a Scarf telemetry
+    event.  The import path now wraps FlowCreate construction in a try/except
+    and re-raises as HTTPException(422).
+    """
+    import json
+
+    flow_data = {
+        "name": "neuro-vision",
+        "data": {},
+        "endpoint_name": "neuro-vision-planning.phase1.contract",
+    }
+    file_content = json.dumps({"folder_name": "proj", "flows": [flow_data]})
+
+    response = await client.post(
+        "api/v1/flows/upload/",
+        files={"file": ("flows.json", file_content, "application/json")},
+        headers=logged_in_headers,
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
+async def test_upload_flow_accepts_valid_endpoint_name(client: AsyncClient, logged_in_headers):
+    """Endpoint names with only letters, numbers, hyphens, and underscores are accepted."""
+    import json
+
+    flow_data = {
+        "name": "neuro-vision",
+        "data": {},
+        "endpoint_name": "neuro-vision-planning_phase1",
+    }
+    file_content = json.dumps({"folder_name": "proj", "flows": [flow_data]})
+
+    response = await client.post(
+        "api/v1/flows/upload/",
+        files={"file": ("flows.json", file_content, "application/json")},
+        headers=logged_in_headers,
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    body = response.json()
+    assert isinstance(body, list)
+    assert len(body) == 1
+    assert body[0]["name"] == "neuro-vision"
 
 
 async def test_upload_flow_rejects_absolute_path(client: AsyncClient, logged_in_headers):
@@ -1048,6 +1350,189 @@ async def test_patch_flow_folder_move_with_deployed_versions_returns_409(
     )
     assert patch_resp.status_code == status.HTTP_409_CONFLICT
     assert "cannot be moved to another project" in patch_resp.json()["detail"].lower()
+
+
+async def test_patch_flow_folder_move_recovers_from_concurrent_write_lock(
+    client: AsyncClient, logged_in_headers, monkeypatch
+):
+    """A competing SQLite commit must not turn a flow move into a 500."""
+    from langflow.api.v1 import flows as flows_module
+    from langflow.services.database.models.folder.model import Folder
+    from langflow.services.deps import session_scope
+
+    project_payload = {"description": "", "flows_list": [], "components_list": []}
+    source_response = await client.post(
+        "api/v1/projects/",
+        json={**project_payload, "name": f"lock-source-{uuid.uuid4()}"},
+        headers=logged_in_headers,
+    )
+    destination_response = await client.post(
+        "api/v1/projects/",
+        json={**project_payload, "name": f"lock-destination-{uuid.uuid4()}"},
+        headers=logged_in_headers,
+    )
+    assert source_response.status_code == status.HTTP_201_CREATED
+    assert destination_response.status_code == status.HTTP_201_CREATED
+    source_project_id = source_response.json()["id"]
+    destination_project_id = destination_response.json()["id"]
+
+    flow_response = await client.post(
+        "api/v1/flows/",
+        json={"name": f"contended-move-{uuid.uuid4()}", "data": {}, "folder_id": source_project_id},
+        headers=logged_in_headers,
+    )
+    assert flow_response.status_code == status.HTTP_201_CREATED
+    flow_id = flow_response.json()["id"]
+
+    original_read_flow = flows_module._read_flow
+    attempts = {"count": 0}
+
+    async def read_flow_with_competing_commit(*args, **kwargs):
+        db_flow = await original_read_flow(*args, **kwargs)
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            async with session_scope() as competing_session:
+                competing_session.add(Folder(name=f"competing-write-{uuid.uuid4()}", user_id=None))
+        return db_flow
+
+    monkeypatch.setattr(flows_module, "_read_flow", read_flow_with_competing_commit)
+
+    patch_response = await client.patch(
+        f"api/v1/flows/{flow_id}",
+        json={"folder_id": destination_project_id},
+        headers=logged_in_headers,
+    )
+
+    assert patch_response.status_code == status.HTTP_200_OK, patch_response.text
+    assert attempts["count"] >= 2, "the PATCH did not retry after its first stale-snapshot write failed"
+    assert patch_response.json()["folder_id"] == destination_project_id
+
+    persisted_response = await client.get(f"api/v1/flows/{flow_id}", headers=logged_in_headers)
+    assert persisted_response.status_code == status.HTTP_200_OK
+    assert persisted_response.json()["folder_id"] == destination_project_id
+
+
+async def test_patch_flow_exhausted_lock_retries_do_not_leak_sql(client: AsyncClient, logged_in_headers, monkeypatch):
+    """An exhausted SQLite lock retry returns a safe, retryable response."""
+    import sqlite3
+
+    from langflow.api.v1 import flows as flows_module
+    from langflow.services.database.lock_retry import DEFAULT_LOCK_RETRY_ATTEMPTS
+    from sqlalchemy.exc import OperationalError
+
+    flow_response = await client.post(
+        "api/v1/flows/",
+        json={"name": f"locked-patch-{uuid.uuid4()}", "data": {}},
+        headers=logged_in_headers,
+    )
+    assert flow_response.status_code == status.HTTP_201_CREATED
+    flow_id = flow_response.json()["id"]
+
+    leaked_statement = "UPDATE flow SET description = ? WHERE flow.id = ?"
+    leaked_value = "bound-description-value"
+    attempts = {"count": 0}
+
+    async def always_locked(**_kwargs):
+        attempts["count"] += 1
+        raise OperationalError(
+            leaked_statement,
+            {"description": leaked_value, "id": flow_id},
+            sqlite3.OperationalError("database is locked"),
+        )
+
+    monkeypatch.setattr(flows_module, "_patch_flow", always_locked)
+    original_retry = flows_module.run_with_lock_retry
+
+    async def run_without_delay(operation, *, session, description):
+        return await original_retry(operation, session=session, description=description, base_delay=0)
+
+    monkeypatch.setattr(flows_module, "run_with_lock_retry", run_without_delay)
+
+    patch_response = await client.patch(
+        f"api/v1/flows/{flow_id}",
+        json={"description": leaked_value},
+        headers=logged_in_headers,
+    )
+
+    assert attempts["count"] == DEFAULT_LOCK_RETRY_ATTEMPTS
+    assert patch_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert patch_response.headers["Retry-After"] == "1"
+    detail = patch_response.json()["detail"]
+    assert detail == flows_module.FLOW_UPDATE_BUSY
+    assert "UPDATE flow" not in detail
+    assert "sqlalche.me" not in detail
+    assert flow_id not in detail
+    assert leaked_value not in detail
+
+
+async def test_patch_flow_lock_retry_supports_api_key_user(
+    client: AsyncClient, logged_in_headers, created_api_key, monkeypatch
+):
+    """Retrying must work when authentication returns a detached UserRead."""
+    import sqlite3
+
+    from langflow.api.v1 import flows as flows_module
+    from sqlalchemy.exc import OperationalError
+
+    flow_response = await client.post(
+        "api/v1/flows/",
+        json={"name": f"api-key-lock-retry-{uuid.uuid4()}", "data": {}},
+        headers=logged_in_headers,
+    )
+    assert flow_response.status_code == status.HTTP_201_CREATED
+    flow_id = flow_response.json()["id"]
+
+    original_patch_flow = flows_module._patch_flow
+    attempts = {"count": 0}
+    statement = "UPDATE flow SET description = ? WHERE flow.id = ?"
+
+    async def patch_after_one_lock(**kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OperationalError(
+                statement,
+                {"description": "updated", "id": flow_id},
+                sqlite3.OperationalError("database is locked"),
+            )
+        return await original_patch_flow(**kwargs)
+
+    monkeypatch.setattr(flows_module, "_patch_flow", patch_after_one_lock)
+
+    patch_response = await client.patch(
+        f"api/v1/flows/{flow_id}",
+        json={"description": "updated"},
+        headers={"x-api-key": created_api_key.api_key},
+    )
+
+    assert attempts["count"] == 2
+    assert patch_response.status_code == status.HTTP_200_OK, patch_response.text
+    assert patch_response.json()["description"] == "updated"
+
+
+async def test_patch_flow_unique_value_with_lock_text_is_not_retried(client: AsyncClient, logged_in_headers):
+    """Bound values that mention lock text must remain ordinary constraint errors."""
+    marker = f"database is locked {uuid.uuid4()}"
+    existing_response = await client.post(
+        "api/v1/flows/",
+        json={"name": marker, "data": {}},
+        headers=logged_in_headers,
+    )
+    victim_response = await client.post(
+        "api/v1/flows/",
+        json={"name": f"unique-lock-marker-{uuid.uuid4()}", "data": {}},
+        headers=logged_in_headers,
+    )
+    assert existing_response.status_code == status.HTTP_201_CREATED
+    assert victim_response.status_code == status.HTTP_201_CREATED
+
+    patch_response = await client.patch(
+        f"api/v1/flows/{victim_response.json()['id']}",
+        json={"name": marker},
+        headers=logged_in_headers,
+    )
+
+    assert patch_response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "must be unique" in patch_response.json()["detail"].lower()
 
 
 async def test_upsert_flow_folder_move_with_deployed_versions_returns_409(

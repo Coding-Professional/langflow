@@ -1,8 +1,8 @@
 import type { UseMutationResult } from "@tanstack/react-query";
 import { cloneDeep, debounce } from "lodash";
 import { SAVE_DEBOUNCE_TIME } from "@/constants/constants";
-import i18n from "../../i18n";
 import type { APIClassType, ResponseErrorDetailAPI } from "@/types/api";
+import i18n from "../../i18n";
 import { updateHiddenOutputs } from "./update-hidden-outputs";
 
 // Map to store debounced functions for each node ID + parameter combination
@@ -16,6 +16,7 @@ export const mutateTemplate = async (
   postTemplateValue: UseMutationResult<
     APIClassType | undefined,
     ResponseErrorDetailAPI,
+    // biome-ignore lint/suspicious/noExplicitAny: legacy mutation payload
     any
   >,
   setErrorData,
@@ -38,6 +39,7 @@ export const mutateTemplate = async (
           postTemplateValue: UseMutationResult<
             APIClassType | undefined,
             ResponseErrorDetailAPI,
+            // biome-ignore lint/suspicious/noExplicitAny: legacy mutation payload
             any
           >,
           setErrorData,
@@ -75,6 +77,12 @@ export const mutateTemplate = async (
             callback?.();
           } catch (e) {
             const error = e as ResponseErrorDetailAPI;
+            // LE-2045: the fallback below identifies nothing, so a client-side
+            // throw is otherwise indistinguishable from a failed request.
+            console.error(
+              `Failed to update template for node ${nodeId}, field ${parameterName}`,
+              e,
+            );
             setErrorData({
               title: i18n.t("input.titleErrorUpdatingComponent"),
               list: [
@@ -89,7 +97,17 @@ export const mutateTemplate = async (
     );
   }
 
-  debouncedFunctions.get(debounceKey)?.(
+  // Enabling Tool Mode mounts the tools_metadata field, which queues its own
+  // debounced refresh. If the user turns Tool Mode off before that refresh
+  // runs, the queued request still carries tool_mode=true and can restore the
+  // Toolset output after the off response. The explicit toggle supersedes that
+  // pending metadata refresh.
+  if (parameterName === "tool_mode") {
+    debouncedFunctions.get(`${nodeId}-tools_metadata`)?.cancel();
+  }
+
+  const debouncedFunction = debouncedFunctions.get(debounceKey);
+  debouncedFunction?.(
     newValue,
     node,
     setNodeClass,
@@ -100,4 +118,11 @@ export const mutateTemplate = async (
     toolMode,
     isRefresh,
   );
+
+  // Tool Mode is a discrete toggle, so delaying it like a text input leaves
+  // the node in its previous output shape and gives slower refresh responses
+  // a chance to repaint the toggle with stale state.
+  if (parameterName === "tool_mode") {
+    await debouncedFunction?.flush();
+  }
 };

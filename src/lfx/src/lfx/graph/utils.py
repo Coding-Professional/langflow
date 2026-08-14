@@ -11,7 +11,8 @@ from lfx.schema.data import Data
 from lfx.schema.message import Message
 
 # Database imports removed - lfx should be lightweight
-from lfx.services.deps import get_settings_service
+from lfx.services.database.service import NoopDatabaseService
+from lfx.services.deps import get_db_service, get_settings_service
 
 if TYPE_CHECKING:
     from lfx.graph.vertex.base import Vertex
@@ -305,6 +306,38 @@ async def log_transaction(
         logger.debug(f"Error logging transaction: {exc!s}")
 
 
+# Latch so the "writer enabled but not running" fall-through log fires once
+# per process. log_vertex_build is a module-level function so we can't keep
+# state on an instance.
+_legacy_vb_fallback_logged: bool = False
+
+
+def _try_enqueue_via_telemetry_writer(vertex_build) -> bool:
+    """Best-effort handoff to the langflow telemetry writer.
+
+    Returns ``True`` when the row was accepted by the writer (caller should
+    skip the direct DB write). Returns ``False`` when langflow isn't installed,
+    the writer isn't started, or the writer rejected the row.
+    """
+    global _legacy_vb_fallback_logged  # noqa: PLW0603 — one-shot module-level latch
+    try:
+        from langflow.services.database.models.vertex_builds.model import VertexBuildTable
+        from langflow.services.deps import get_telemetry_writer_service
+    except ImportError:
+        return False
+    writer = get_telemetry_writer_service()
+    if writer is None or not writer.is_running():
+        if not _legacy_vb_fallback_logged:
+            _legacy_vb_fallback_logged = True
+            logger.warning(
+                "telemetry_writer_enabled=True but writer is not running; "
+                "falling back to legacy direct-write path for vertex_builds"
+            )
+        return False
+    table = VertexBuildTable(**vertex_build.model_dump())
+    return writer.enqueue_vertex_build(table.model_dump(mode="python"))
+
+
 async def log_vertex_build(
     *,
     flow_id: str | UUID,
@@ -324,13 +357,19 @@ async def log_vertex_build(
     try:
         # Try to use langflow's services if available (when running within langflow)
         try:
-            from langflow.services.deps import get_db_service as langflow_get_db_service
-            from langflow.services.deps import get_settings_service as langflow_get_settings_service
-
-            settings_service = langflow_get_settings_service()
+            settings_service = get_settings_service()
             if not settings_service:
                 return
             if not getattr(settings_service.settings, "vertex_builds_storage_enabled", False):
+                return
+
+            # Resolve only the database service already registered with the shared
+            # LFX service manager. Calling langflow.services.deps.get_db_service()
+            # here would install Langflow's default DatabaseService as a lookup
+            # side effect, turning a DB-less `lfx serve` process into a partially
+            # initialized DB runtime between two vertices in the same graph run.
+            db_service = get_db_service()
+            if isinstance(db_service, NoopDatabaseService):
                 return
 
             if isinstance(flow_id, str):
@@ -366,8 +405,13 @@ async def log_vertex_build(
                 job_id=job_id,
             )
 
-            db_service = langflow_get_db_service()
-            if db_service is None:
+            # When the telemetry writer is enabled and started, route the row
+            # through its disk-backed outbox so the write does not contend on
+            # the request-handling DB pool. Falls through to a direct write
+            # when the writer is not ready or disabled.
+            if getattr(
+                settings_service.settings, "telemetry_writer_enabled", False
+            ) and _try_enqueue_via_telemetry_writer(vertex_build):
                 return
 
             async with db_service._with_session() as session:  # noqa: SLF001

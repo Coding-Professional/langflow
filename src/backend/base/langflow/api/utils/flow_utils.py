@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from fastapi import HTTPException
 from lfx.graph.graph.base import Graph
@@ -13,6 +14,7 @@ from sqlalchemy import delete
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from langflow.services.database.models.auth.authz import AuthzShare
 from langflow.services.database.models.deployment.exceptions import (
     araise_if_deployment_guard_error_or_skip,
 )
@@ -58,6 +60,9 @@ async def build_graph_from_data(flow_id: uuid.UUID | str, payload: dict, **kwarg
             vertex.update_raw_params({"session_id": session_id}, overwrite=True)
 
     graph.session_id = session_id
+    # Pin the caller's run_id before initialize_run so HITL resume reuses the pre-pause trace.
+    if (caller_run_id := kwargs.get("run_id")) is not None:
+        graph.set_run_id(caller_run_id)
     await graph.initialize_run()
     return graph
 
@@ -112,6 +117,14 @@ async def cascade_delete_flow(session: AsyncSession, flow_id: uuid.UUID) -> None
         if trace_ids:
             await session.exec(delete(SpanTable).where(col(SpanTable.trace_id).in_(trace_ids)))
             await session.exec(delete(TraceTable).where(col(TraceTable.id).in_(trace_ids)))
+        # authz_share is polymorphic over resource_type/resource_id with no
+        # FK, so DB cascades cannot remove stale share rows when the flow is
+        # deleted. Clean them up here so a deleted flow's grants do not
+        # silently survive — that would let an authorization plugin keep
+        # honoring share rows that point at a tombstoned resource.
+        await session.exec(
+            delete(AuthzShare).where(AuthzShare.resource_type == "flow").where(AuthzShare.resource_id == flow_id)
+        )
         await session.exec(delete(Flow).where(Flow.id == flow_id))
     except Exception as e:
         await araise_if_deployment_guard_error_or_skip(
@@ -122,17 +135,81 @@ async def cascade_delete_flow(session: AsyncSession, flow_id: uuid.UUID) -> None
         raise RuntimeError(msg, e) from e
 
 
-def compute_virtual_flow_id(identifier: str | uuid.UUID, flow_id: uuid.UUID) -> uuid.UUID:
+# Public flow file paths must be ``{source_flow_id}/{safe_basename}`` — uploads
+# under that namespace are the only legitimate inputs for an unauthenticated
+# build. Anything else (absolute paths, traversal, foreign flow_ids) is a
+# probe at the arbitrary-file-read class of bug (GHSA-rcjh-r59h-gq37).
+_PUBLIC_FILE_PATH_RE = re.compile(
+    r"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/([^/\\]+)$"
+)
+_PUBLIC_FILE_REJECTED_SUBSTRINGS = ("\x00", "..", "\\")
+
+
+def validate_public_files(files: list[str] | None, source_flow_id: uuid.UUID) -> None:
+    """Reject file references that aren't ``{source_flow_id}/{basename}``.
+
+    Mitigates GHSA-rcjh-r59h-gq37: an unauthenticated build must not be
+    able to address files outside its own flow's storage namespace.
+    Called from any endpoint that accepts caller-supplied file references
+    under a public-access boundary.
+    """
+    if not files:
+        return
+    expected_flow_id = str(source_flow_id).lower()
+    for entry in files:
+        if not isinstance(entry, str) or not entry:
+            raise HTTPException(status_code=400, detail="Invalid file entry")
+        if any(token in entry for token in _PUBLIC_FILE_REJECTED_SUBSTRINGS):
+            raise HTTPException(status_code=400, detail="Invalid file path")
+        match = _PUBLIC_FILE_PATH_RE.match(entry)
+        if not match:
+            raise HTTPException(status_code=400, detail="Invalid file path format")
+        flow_id_segment, basename = match.group(1), match.group(2)
+        if flow_id_segment.lower() != expected_flow_id:
+            raise HTTPException(status_code=400, detail="File not in this flow's namespace")
+        if basename in (".", ".."):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+
+def compute_virtual_flow_id(
+    identifier: str | uuid.UUID,
+    flow_id: uuid.UUID,
+    *,
+    principal_type: Literal["user", "client"] | None = None,
+) -> uuid.UUID:
     """Compute a deterministic virtual flow ID for session/message isolation.
 
     Args:
         identifier: A unique identifier (user_id for authenticated users, client_id for anonymous).
         flow_id: The original flow ID.
+        principal_type: Optional identity domain for public-flow callers. Authenticated
+            user IDs and anonymous client IDs must never share a UUID namespace.
 
     Returns:
         A deterministic UUID v5 derived from the identifier and flow_id.
     """
-    return uuid.uuid5(uuid.NAMESPACE_DNS, f"{identifier}_{flow_id}")
+    namespaced_identifier = f"{principal_type}:{identifier}" if principal_type else str(identifier)
+    return uuid.uuid5(uuid.NAMESPACE_DNS, f"{namespaced_identifier}_{flow_id}")
+
+
+def scope_session_to_namespace(session: str | None, namespace: str) -> str | None:
+    """Wrap a caller-supplied session ID under a (client_id, flow_id) namespace.
+
+    Mitigates CVE-2026-33017: an unauthenticated public-flow caller cannot
+    address a session that lives outside its own namespace through a Memory
+    component, regardless of whether the caller supplies a non-empty,
+    pre-prefixed, or empty string.
+
+    Returns ``None`` unchanged. Returns the value unchanged when it equals the
+    namespace or already starts with ``f"{namespace}:"``. Otherwise prefixes
+    it -- including the empty-string case, which becomes ``f"{namespace}:"``.
+    """
+    if session is None:
+        return session
+    prefix = f"{namespace}:"
+    if session == namespace or session.startswith(prefix):
+        return session
+    return f"{prefix}{session}"
 
 
 async def verify_public_flow_and_get_user(
@@ -180,9 +257,17 @@ async def verify_public_flow_and_get_user(
         if not flow or flow.access_type is not AccessTypeEnum.PUBLIC:
             raise HTTPException(status_code=403, detail="Flow is not public")
 
-    # Use authenticated user_id for deterministic UUID when available, otherwise client_id
-    identifier = str(authenticated_user_id) if authenticated_user_id else client_id
-    new_flow_id = compute_virtual_flow_id(identifier, flow_id)
+    # Use authenticated user_id for deterministic UUID when available, otherwise client_id.
+    # Keep the branches explicit so identifier is non-optional at the UUID boundary.
+    if authenticated_user_id is not None:
+        identifier = str(authenticated_user_id)
+        principal_type: Literal["user", "client"] = "user"
+    else:
+        if client_id is None:
+            raise HTTPException(status_code=400, detail="No client_id cookie found")
+        identifier = client_id
+        principal_type = "client"
+    new_flow_id = compute_virtual_flow_id(identifier, flow_id, principal_type=principal_type)
 
     # Get the user associated with the flow
     try:

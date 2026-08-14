@@ -18,6 +18,7 @@ from langflow.services.database.models.flow_version.model import FlowVersion
 from langflow.services.database.models.flow_version_deployment_attachment.model import (
     FlowVersionDeploymentAttachment,
 )
+from langflow.services.database.models.folder.model import Folder
 from langflow.services.deps import session_scope
 from lfx.services.adapters.deployment.schema import DeploymentType
 
@@ -137,6 +138,32 @@ async def test_update_project(client: AsyncClient, logged_in_headers, basic_case
     assert "parent_id" in result, "The dictionary must contain a key called 'parent_id'"
 
 
+async def test_update_project_rejects_unowned_parent_id(
+    client: AsyncClient, logged_in_headers, basic_case, active_user
+):
+    """Reparenting under a folder the caller does not own returns 404.
+
+    Regression for an IDOR footgun: a tenant-supplied parent_id was assigned without verifying
+    the parent folder belongs to the caller.
+    """
+    other_user_id, _ = await _create_other_user(client)
+    async with session_scope() as session:
+        project = Folder(name=f"Project {uuid4()}", description="", user_id=active_user.id)
+        other_parent = Folder(name=f"Other User Parent {uuid4()}", description="", user_id=UUID(other_user_id))
+        session.add(project)
+        session.add(other_parent)
+        await session.commit()
+        await session.refresh(project)
+        await session.refresh(other_parent)
+        proj_id = project.id
+        other_parent_id = other_parent.id
+
+    update_case = basic_case.copy()
+    update_case["parent_id"] = str(other_parent_id)
+    response = await client.patch(f"api/v1/projects/{proj_id}", json=update_case, headers=logged_in_headers)
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
 async def test_create_project_validation_error(client: AsyncClient, logged_in_headers, basic_case):
     invalid_case = basic_case.copy()
     invalid_case.pop("name")
@@ -153,6 +180,76 @@ async def test_delete_project_then_404(client: AsyncClient, logged_in_headers, b
 
     get_resp = await client.get(f"api/v1/projects/{proj_id}", headers=logged_in_headers)
     assert get_resp.status_code == status.HTTP_404_NOT_FOUND
+
+
+async def test_delete_project_recovers_from_concurrent_write_lock(
+    client: AsyncClient, logged_in_headers, basic_case, monkeypatch
+):
+    """LE-2020: a competing commit must not turn DELETE into a 500 that leaves the project behind.
+
+    ``delete_project`` runs inside ``begin_nested()`` — the SAVEPOINT opens a DEFERRED
+    SQLite transaction, and the reads it performs (flow enumeration, deployment check)
+    pin a read snapshot. When another connection commits before the row delete runs,
+    SQLite answers SQLITE_BUSY_SNAPSHOT *immediately*: the busy handler is never
+    invoked, so ``busy_timeout`` cannot help and only restarting the transaction can.
+
+    The contention is injected with a real second connection committing a real row —
+    the DB is never mocked, only the timing is made deterministic instead of load-dependent.
+    """
+    from langflow.api.v1 import projects as projects_module
+
+    create_resp = await client.post("api/v1/projects/", json=basic_case, headers=logged_in_headers)
+    assert create_resp.status_code == status.HTTP_201_CREATED
+    project_id = create_resp.json()["id"]
+
+    original_check = projects_module.check_project_has_deployments
+    attempts = {"count": 0}
+
+    async def check_with_competing_commit(session, *, project_id):
+        # Only the first attempt races: a retry must find a quiet database and win.
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            async with session_scope() as competing_session:
+                competing_session.add(Folder(name=f"competing-write-{uuid4()}", user_id=None))
+        return await original_check(session, project_id=project_id)
+
+    monkeypatch.setattr(projects_module, "check_project_has_deployments", check_with_competing_commit)
+
+    delete_resp = await client.delete(f"api/v1/projects/{project_id}", headers=logged_in_headers)
+
+    assert attempts["count"] >= 1, "the contention hook never ran — the test no longer exercises the race"
+    assert delete_resp.status_code == status.HTTP_204_NO_CONTENT, delete_resp.text
+
+    get_resp = await client.get(f"api/v1/projects/{project_id}", headers=logged_in_headers)
+    assert get_resp.status_code == status.HTTP_404_NOT_FOUND
+
+
+async def test_delete_project_does_not_leak_sql_on_database_error(
+    client: AsyncClient, logged_in_headers, basic_case, monkeypatch
+):
+    """LE-2020: the error payload must never echo the statement, table or bound parameters."""
+    import sqlite3
+
+    from langflow.api.v1 import projects as projects_module
+    from sqlalchemy.exc import OperationalError
+
+    create_resp = await client.post("api/v1/projects/", json=basic_case, headers=logged_in_headers)
+    project_id = create_resp.json()["id"]
+
+    leaked_statement = "DELETE FROM folder WHERE folder.id = ?"
+
+    async def always_locked(session, *, project_id):  # noqa: ARG001
+        raise OperationalError(leaked_statement, {"id": project_id}, sqlite3.OperationalError("database is locked"))
+
+    monkeypatch.setattr(projects_module, "check_project_has_deployments", always_locked)
+
+    delete_resp = await client.delete(f"api/v1/projects/{project_id}", headers=logged_in_headers)
+
+    assert delete_resp.status_code != status.HTTP_204_NO_CONTENT
+    detail = delete_resp.json()["detail"]
+    assert "DELETE FROM folder" not in detail
+    assert "sqlalche.me" not in detail
+    assert str(project_id) not in detail
 
 
 async def test_read_project_invalid_id_format(client: AsyncClient, logged_in_headers):
@@ -1852,7 +1949,7 @@ async def _attach_deployment_to_flow(*, user_id: UUID, flow_id: UUID, project_id
             project_id=project_id,
             deployment_provider_account_id=provider.id,
             resource_key=f"rk-{flow_id.hex[:8]}",
-            name=f"deployment-{flow_id.hex[:8]}",
+            display_name=f"deployment-{flow_id.hex[:8]}",
             deployment_type=DeploymentType.AGENT,
         )
         session.add(deployment)

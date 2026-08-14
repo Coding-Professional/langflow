@@ -227,6 +227,7 @@ class Vertex:
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_lock"] = None  # Locks are not serializable
+        state["custom_component"] = None  # Component instances are rebuilt and may hold non-serializable runtime state
         state["built_object"] = None if isinstance(self.built_object, UnbuiltObject) else self.built_object
         state["built_result"] = None if isinstance(self.built_result, UnbuiltResult) else self.built_result
         return state
@@ -354,7 +355,7 @@ class Vertex:
         self.load_from_db_fields = load_from_db_fields
         self.raw_params = self.params.copy()
 
-    def update_raw_params(self, new_params: Mapping[str, str | list[str]], *, overwrite: bool = False) -> None:
+    def update_raw_params(self, new_params: Mapping[str, Any], *, overwrite: bool = False) -> None:
         """Update the raw parameters of the vertex with the given new parameters.
 
         Args:
@@ -370,11 +371,13 @@ class Vertex:
             return
         if any(isinstance(self.raw_params.get(key), Vertex) for key in new_params):
             return
+        params_to_update = dict(new_params)
         if not overwrite:
-            for key in new_params.copy():  # type: ignore[attr-defined]
+            for key in params_to_update.copy():
                 if key not in self.raw_params:
-                    new_params.pop(key)  # type: ignore[attr-defined]
-        self.raw_params.update(new_params)
+                    params_to_update.pop(key)
+        params_to_update = ParameterHandler(self, storage_service=None).process_runtime_params(params_to_update)
+        self.raw_params.update(params_to_update)
         self.params = self.raw_params.copy()
         self.updated_raw_params = True
 
@@ -404,9 +407,14 @@ class Vertex:
             )
         else:
             custom_component = self.custom_component
+            # A checkpoint-restored component (HITL resume) loses _user_id, which
+            # load_from_db fields (API keys) need; re-apply without overriding.
+            if user_id is not None and getattr(custom_component, "_user_id", None) is None:
+                custom_component._user_id = user_id  # noqa: SLF001 — re-apply user after checkpoint restore
             if hasattr(self.custom_component, "set_event_manager"):
                 self.custom_component.set_event_manager(event_manager)
             custom_params = initialize.loading.get_params(self.params)
+            custom_params.pop("code", None)
 
         await self._build_results(
             custom_component=custom_component,
@@ -658,6 +666,13 @@ class Vertex:
         """Iterates over a list of vertices, builds each and updates the params dictionary."""
         self.params[key] = []
         for vertex in vertices:
+            # A conditionally-excluded predecessor that never built contributes nothing to a
+            # list input. Pulling a result for it would return this input's template default
+            # (e.g. an empty Message) and inject a stray element next to the real branch's
+            # value -- ``ComponentVertex._get_result`` returns that default for the
+            # single-value case, which is wrong for a merged list.
+            if not vertex.built and vertex.id in self.graph.conditionally_excluded_vertices:
+                continue
             result = await vertex.get_result(self, target_handle_name=key)
             # Weird check to see if the params[key] is a list
             # because sometimes it is a Data and breaks the code

@@ -49,7 +49,7 @@ export const useUtilityStore = create<UtilityStoreType>((set, get) => ({
   currentSessionId: "",
   setCurrentSessionId: (sessionId: string) =>
     set({ currentSessionId: sessionId }),
-  eventDelivery: EventDeliveryType.POLLING,
+  eventDelivery: EventDeliveryType.STREAMING,
   setEventDelivery: (eventDelivery: EventDeliveryType) =>
     set({ eventDelivery }),
   webhookAuthEnable: true,
@@ -64,6 +64,37 @@ export const useUtilityStore = create<UtilityStoreType>((set, get) => ({
   allowCustomComponents: true,
   setAllowCustomComponents: (allowCustomComponents: boolean) =>
     set({ allowCustomComponents }),
+  a2aEnabled: false,
+  setA2aEnabled: (a2aEnabled: boolean) => set({ a2aEnabled }),
+  // Default true (backend default) so the panel doesn't flash the disabled
+  // state before the /config reply lands.
+  agenticExperienceEnabled: true,
+  setAgenticExperienceEnabled: (agenticExperienceEnabled: boolean) =>
+    set({ agenticExperienceEnabled }),
   mcpBaseUrl: "",
   setMcpBaseUrl: (mcpBaseUrl: string) => set({ mcpBaseUrl }),
+  // Default false to match the backend's "reload disabled" default until the
+  // /config query overwrites it on first load.
+  enableExtensionReload: false,
+  setEnableExtensionReload: (enableExtensionReload: boolean) =>
+    set({ enableExtensionReload }),
+  // Embedded mode flags
+  embeddedMode: false,
+  setEmbeddedMode: (embeddedMode: boolean) => set({ embeddedMode }),
+  hideLogoutButton: false,
+  setHideLogoutButton: (hideLogoutButton: boolean) => set({ hideLogoutButton }),
+  hideNewProjectButton: false,
+  setHideNewProjectButton: (hideNewProjectButton: boolean) =>
+    set({ hideNewProjectButton }),
+  hideNewFlowButton: false,
+  setHideNewFlowButton: (hideNewFlowButton: boolean) =>
+    set({ hideNewFlowButton }),
+  hideStarterProjects: false,
+  setHideStarterProjects: (hideStarterProjects: boolean) =>
+    set({ hideStarterProjects }),
+  mcpServersLocked: false,
+  setMcpServersLocked: (mcpServersLocked: boolean) => set({ mcpServersLocked }),
+  customComponentAdminOnly: false,
+  setCustomComponentAdminOnly: (customComponentAdminOnly: boolean) =>
+    set({ customComponentAdminOnly }),
 }));

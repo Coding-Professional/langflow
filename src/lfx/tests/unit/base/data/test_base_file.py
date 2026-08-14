@@ -2,11 +2,16 @@
 
 import json
 import tempfile
+import threading
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
 from lfx.base.data.base_file import BaseFileComponent
 from lfx.schema.data import Data
 from lfx.schema.message import Message
+from lfx.utils.file_path_security import LocalFileAccessError
 
 
 class TestFileComponent(BaseFileComponent):
@@ -249,3 +254,253 @@ class TestLoadFilesMessage:
         assert "Field extraction" in result_text
         # JSON content should be present in some form
         assert "parsed" in result_text or "Dict content" in result_text
+
+
+class TestDeleteAfterProcessingRaceCondition:
+    """Tests for race condition when delete_server_file_after_processing=True."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.component = TestFileComponent()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_path = Path(self.temp_dir.name)
+
+    def teardown_method(self):
+        """Clean up test fixtures."""
+        self.temp_dir.cleanup()
+
+    def test_concurrent_output_calls_share_processed_result_when_delete_after_processing(self):
+        """Concurrent output calls share the cached parsed result after the server file is gone.
+
+        When delete_after_processing=True and the server file has already been deleted by a
+        prior output call on the same component instance, load_files_base must return the cached
+        processed result so downstream outputs receive the same parsed data instead of empty Data.
+
+        This covers the race condition where a File component with multiple connected outputs
+        invokes load_files_base() more than once: the first call processes and deletes the
+        server file; the second call must neither raise nor silently drop output data.
+        """
+        # Create a real file with known content
+        server_file = self.temp_path / "server_file.txt"
+        server_file.write_text("content", encoding="utf-8")
+
+        # Set up the component with the server file path via file_path Data input
+        file_data = Data(data={"file_path": str(server_file)})
+        self.component.file_path = file_data
+        self.component.delete_server_file_after_processing = True
+        self.component.silent_errors = False  # Ensure errors would normally propagate
+
+        # First call: processes and deletes the file
+        first_result = self.component.load_files_base()
+        assert not server_file.exists(), "File should have been deleted after first call"
+        assert first_result, "First call should return non-empty parsed data"
+
+        # Second call: file is already gone; should NOT raise and must NOT drop the data.
+        # The cached processed result from the first call should be returned so a second
+        # downstream output sees the same content rather than an empty Data wrapper.
+        second_result = self.component.load_files_base()
+        assert second_result == first_result, (
+            "Second call on deleted server file must return the cached processed data "
+            "(not an empty list), to preserve output correctness for concurrent outputs."
+        )
+
+    def test_validate_raises_for_missing_file_when_not_delete_after_processing(self):
+        """When delete_after_processing=False, a missing file should still raise ValueError.
+
+        Exercises the ``file_path`` decision branch in load_files_base (not the ``self.path``
+        branch) so the non-race-condition error path is covered for server-file inputs.
+        """
+        missing_path = self.temp_path / "nonexistent.txt"
+
+        self.component.file_path = Data(data={"file_path": str(missing_path)})
+        self.component.delete_server_file_after_processing = False
+        self.component.silent_errors = False
+
+        import pytest
+
+        with pytest.raises(ValueError, match="File not found"):
+            self.component.load_files_base()
+
+    def test_concurrent_output_calls_are_serialized(self):
+        """Concurrent load_files_base() calls on the same instance must share parsed data.
+
+        Exercises the lock + keyed cache path: two threads enter load_files_base at the
+        same time. Only one should execute the read+process+delete cycle; the other must
+        observe the cached parsed result rather than racing past validation and producing
+        empty output.
+        """
+        server_file = self.temp_path / "concurrent_file.txt"
+        server_file.write_text("concurrent-content", encoding="utf-8")
+
+        self.component.file_path = Data(data={"file_path": str(server_file)})
+        self.component.delete_server_file_after_processing = True
+        self.component.silent_errors = False
+
+        results: list[list[Data]] = []
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            try:
+                barrier.wait(timeout=5)
+                results.append(self.component.load_files_base())
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not errors, f"Concurrent load_files_base() raised: {errors!r}"
+        assert len(results) == 2
+        assert results[0], "First completed call should return non-empty parsed data"
+        assert results[0] == results[1], (
+            "Concurrent calls must return identical parsed data — neither caller should "
+            "silently fall through to empty output when the other deletes the server file."
+        )
+        assert not server_file.exists(), "Server file should have been deleted exactly once"
+
+    def test_cache_does_not_pollute_legitimate_empty_input(self):
+        """An empty validation result (no input configured) must not return stale cached data.
+
+        Covers the secondary blocker: race-recovery should only activate when validation
+        actually skipped a missing ``delete_after_processing=True`` server file, not for
+        every empty validation result.
+        """
+        # Configure a fresh component with no inputs at all.
+        self.component.file_path = None
+        self.component.path = []
+        self.component.delete_server_file_after_processing = True
+
+        # First call has no input → returns empty without populating recovery cache.
+        first = self.component.load_files_base()
+        assert first == [], "Empty input should yield empty output, not stale cache"
+
+        # Now simulate that a *different* prior call did populate the cache for some
+        # other set of paths. The empty-input call must not pick that up.
+        cached_data = [Data(data={"text": "stale", "file_path": "/tmp/old.txt"})]
+        self.component._load_files_base_processed_cache = {  # type: ignore[attr-defined]
+            ((), ("/tmp/old.txt",), False): cached_data,
+        }
+
+        second = self.component.load_files_base()
+        assert second == [], (
+            "Race-recovery must be keyed to the current paths and gated on the "
+            "validation-skip flag; an empty input must not return a stale cached result."
+        )
+
+
+class TestS3DeleteAfterProcessingSecurity:
+    """Regression tests for storage-aware cleanup of S3-backed server files."""
+
+    @pytest.fixture(autouse=True)
+    def _s3_settings(self, monkeypatch, tmp_path):
+        settings = SimpleNamespace(
+            config_dir=str(tmp_path / "config"),
+            database_url="",
+            restrict_local_file_access=False,
+            storage_type="s3",
+        )
+        settings_service = SimpleNamespace(settings=settings)
+        monkeypatch.setattr("lfx.base.data.base_file.get_settings_service", lambda: settings_service)
+        monkeypatch.setattr("lfx.utils.file_path_security.get_settings_service", lambda: settings_service)
+        self.settings = settings
+
+    def test_restricted_s3_rejects_out_of_scope_absolute_local_file(self, tmp_path):
+        canary = tmp_path / "outside.txt"
+        canary.write_text("SAFE_CANARY", encoding="utf-8")
+
+        component = TestFileComponent()
+        component._user_id = "user-id"
+        component.file_path = Data(data={"file_path": str(canary)})
+        component.delete_server_file_after_processing = True
+        self.settings.restrict_local_file_access = True
+
+        with pytest.raises(LocalFileAccessError):
+            component.load_files_base()
+
+        assert canary.read_text(encoding="utf-8") == "SAFE_CANARY"
+
+    def test_unrestricted_s3_local_file_is_read_but_never_deleted(self, tmp_path):
+        canary = tmp_path / "local-input.txt"
+        canary.write_text("SAFE_CANARY", encoding="utf-8")
+
+        component = TestFileComponent()
+        component.file_path = Data(data={"file_path": str(canary)})
+        component.delete_server_file_after_processing = True
+
+        result = component.load_files_base()
+
+        assert result[0].data["text"] == "SAFE_CANARY"
+        assert canary.read_text(encoding="utf-8") == "SAFE_CANARY"
+
+    def test_s3_component_temp_file_uses_explicit_local_cleanup(self, monkeypatch, tmp_path):
+        temp_file = tmp_path / "component-download.txt"
+        temp_file.write_text("SAFE_CANARY", encoding="utf-8")
+        storage_service = SimpleNamespace(delete_file=AsyncMock())
+        monkeypatch.setattr("lfx.base.data.base_file.get_storage_service", lambda: storage_service, raising=False)
+
+        component = TestFileComponent()
+        base_file = BaseFileComponent.BaseFile(
+            Data(data={"file_path": str(temp_file)}),
+            temp_file,
+            delete_after_processing=True,
+            cleanup_local_file=True,
+        )
+
+        component._delete_after_processing(base_file)
+
+        assert not temp_file.exists()
+        storage_service.delete_file.assert_not_awaited()
+
+    def test_s3_user_key_cleanup_uses_storage_service_without_local_unlink(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        local_collision = tmp_path / "user-id" / "file.txt"
+        local_collision.parent.mkdir()
+        local_collision.write_text("SAFE_CANARY", encoding="utf-8")
+
+        storage_service = SimpleNamespace(delete_file=AsyncMock())
+        monkeypatch.setattr("lfx.base.data.base_file.get_storage_service", lambda: storage_service, raising=False)
+
+        component = TestFileComponent()
+        component._user_id = "user-id"
+        component.file_path = Data(data={"file_path": "user-id/file.txt"})
+        component.delete_server_file_after_processing = True
+
+        component.load_files_base()
+
+        storage_service.delete_file.assert_awaited_once_with("user-id", "file.txt")
+        assert local_collision.read_text(encoding="utf-8") == "SAFE_CANARY"
+
+    @pytest.mark.parametrize("caller_scope", [None, "attacker-id"], ids=["missing-scope", "different-scope"])
+    def test_s3_key_cleanup_skips_unauthorized_scope(self, monkeypatch, caller_scope):
+        storage_service = SimpleNamespace(delete_file=AsyncMock())
+        monkeypatch.setattr("lfx.base.data.base_file.get_storage_service", lambda: storage_service, raising=False)
+
+        component = TestFileComponent()
+        if caller_scope is not None:
+            component._user_id = caller_scope
+        component.file_path = Data(data={"file_path": "victim-id/file.txt"})
+        component.delete_server_file_after_processing = True
+
+        component.load_files_base()
+
+        storage_service.delete_file.assert_not_awaited()
+
+    def test_s3_key_cleanup_rejects_flow_id_collision_with_other_user(self, monkeypatch):
+        storage_service = SimpleNamespace(delete_file=AsyncMock())
+        monkeypatch.setattr("lfx.base.data.base_file.get_storage_service", lambda: storage_service, raising=False)
+
+        component = TestFileComponent()
+        component._user_id = "attacker-id"
+        component._vertex = SimpleNamespace(
+            graph=SimpleNamespace(user_id="attacker-id", flow_id="victim-id"),
+        )
+        component.file_path = Data(data={"file_path": "victim-id/file.txt"})
+        component.delete_server_file_after_processing = True
+
+        component.load_files_base()
+
+        storage_service.delete_file.assert_not_awaited()

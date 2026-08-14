@@ -20,6 +20,7 @@ from lfx.schema.dotdict import dotdict
 from lfx.services.cache.utils import CacheMiss
 from lfx.services.deps import get_shared_component_cache_service
 from lfx.template.field.base import Output
+from lfx.utils.flow_validation import is_protected_tweak_field
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -31,6 +32,7 @@ class RunFlowBaseComponent(Component):
     def __init__(self, *args, **kwargs):
         self._flow_output_methods: set[str] = set()
         super().__init__(*args, **kwargs)
+        self.flow_tweak_data = self._attributes.get("flow_tweak_data")
         self.add_tool_output = True
         ################################################################
         # cache the selected flow's graph in the shared component cache
@@ -95,8 +97,15 @@ class RunFlowBaseComponent(Component):
     _base_outputs: list[Output] = []
     default_keys = ["code", "_type", "flow_name_selected", "flow_id_selected", "session_id", "cache_flow"]
     FLOW_INPUTS: list[dotdict] = []
-    flow_tweak_data: dict = {}
     IOPUT_SEP = "~"  # separator for joining a vertex id and input/output name to form a unique input/output name
+
+    @property
+    def flow_tweak_data(self) -> dict[str, Any]:
+        return self._attributes.setdefault("flow_tweak_data", {})
+
+    @flow_tweak_data.setter
+    def flow_tweak_data(self, value: dict[str, Any] | None) -> None:
+        self._attributes["flow_tweak_data"] = value if value is not None else {}
 
     ################################################################
     # set and register the selected flow's output methods
@@ -203,6 +212,7 @@ class RunFlowBaseComponent(Component):
                         ),
                         # TODO: make this more robust?
                         "tool_mode": not (field_template[input_name].get("advanced", False)),
+                        "input_types": self._resolve_exposed_input_types(field_template[input_name]),
                     }
                 )
                 for input_name in field_order
@@ -210,6 +220,23 @@ class RunFlowBaseComponent(Component):
             ]
             new_fields.extend(new_vertex_inputs)
         return new_fields
+
+    @staticmethod
+    def _resolve_exposed_input_types(field_template_entry: dict) -> list[str]:
+        """Resolve input_types for a flow input re-exposed via Run Flow.
+
+        Some components (e.g. ChatInput) explicitly set ``input_types=[]`` on
+        text-typed inputs to suppress connection handles within their own
+        flow. When Run Flow re-exposes those fields the user expects to wire
+        upstream components into them, so we restore a Message handle for
+        text-typed fields with no input_types.
+        """
+        existing = field_template_entry.get("input_types") or []
+        if existing:
+            return list(existing)
+        if field_template_entry.get("type") in {"str", "Text"}:
+            return ["Message"]
+        return list(existing)
 
     def add_new_fields(self, build_config: dotdict, new_fields: list[dotdict]) -> dotdict:
         """Add new fields to the build_config."""
@@ -518,7 +545,11 @@ class RunFlowBaseComponent(Component):
                 graph=graph,
             )
 
-        except Exception:  # noqa: BLE001
+        except Exception as exc:
+            from lfx.run.hitl import NestedHITLUnsupportedError
+
+            if isinstance(exc, NestedHITLUnsupportedError):
+                raise
             msg = f"Error running flow: {self.flow_name_selected}"
             raise RuntimeError(msg) from None
 
@@ -737,6 +768,19 @@ class RunFlowBaseComponent(Component):
                 continue
             if not (node_tweaks := tweaks.get(vertex.id)):
                 continue
-            node_tweaks.pop("code", None)
-            vertex.update_raw_params(node_tweaks, overwrite=True)
+            template_data = vertex.data.get("node", {}).get("template", {})
+            component_type = vertex.data.get("type")
+            if not isinstance(template_data, dict):
+                continue
+            safe_tweaks = {}
+            for tweak_name, tweak_value in node_tweaks.items():
+                field = template_data.get(tweak_name)
+                if not isinstance(field, dict):
+                    continue
+                if is_protected_tweak_field(component_type, tweak_name, field.get("type", "")):
+                    logger.warning(f"Security: refusing to override protected field {tweak_name!r} via tweaks.")
+                    continue
+                safe_tweaks[tweak_name] = tweak_value
+            if safe_tweaks:
+                vertex.update_raw_params(safe_tweaks, overwrite=True)
         return graph

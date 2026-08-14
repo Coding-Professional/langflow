@@ -1,12 +1,28 @@
+from __future__ import annotations
+
 import json
+from collections.abc import Awaitable, Callable  # noqa: TC003
+from typing import TYPE_CHECKING
 
-from langchain_core.messages import ToolCall
-from toolguard.runtime import PolicyViolationException
-from toolguard.runtime.runtime import ToolguardRuntime
+from pydantic import Field
 
-from lfx.components.models_and_agents.policies.tool_invoker import ToolInvoker
 from lfx.field_typing import Tool
 from lfx.log.logger import logger
+
+if TYPE_CHECKING:
+    from langchain_core.messages import ToolCall
+    from toolguard.runtime.runtime import ToolguardRuntime
+
+    from lfx.components.models_and_agents.policies.tool_invoker import ToolInvoker
+
+
+def _is_policy_violation_exception(exc: Exception) -> bool:
+    try:
+        from toolguard.runtime import PolicyViolationException
+    except ImportError:
+        return False
+
+    return isinstance(exc, PolicyViolationException)
 
 
 class GuardedTool(Tool):
@@ -21,7 +37,14 @@ class GuardedTool(Tool):
     _tool_invoker: ToolInvoker
     _toolguard: ToolguardRuntime
 
+    # These callables are bound to this instance, so including them in the model
+    # representation would recursively render the GuardedTool itself.
+    func: Callable[..., str] | None = Field(repr=False)
+    coroutine: Callable[..., Awaitable[str]] | None = Field(default=None, repr=False)
+
     def __init__(self, tool: Tool, all_tools: list[Tool], toolguard: ToolguardRuntime):
+        from lfx.components.models_and_agents.policies.tool_invoker import ToolInvoker
+
         super().__init__(
             name=tool.name,
             description=tool.description,
@@ -88,17 +111,19 @@ class GuardedTool(Tool):
             try:
                 await self._toolguard.guard_toolcall(self.name, args=args, delegate=self._tool_invoker)
                 return await self._orig_tool.arun(tool_input=args, config=config, **kwargs)
-            except PolicyViolationException as ex:
-                logger.debug(f"exception: {ex.message}")
+            except Exception as ex:
+                if not _is_policy_violation_exception(ex):
+                    logger.exception("Unhandled exception in class GuardedTool.arun()")
+                    raise
+
+                message = getattr(ex, "message", str(ex))
+                logger.debug(f"exception: {message}")
                 return {
                     "ok": False,
                     "error": {
                         "type": "PolicyViolationException",
                         "code": "FAILURE",
-                        "message": ex.message,
+                        "message": message,
                         "retryable": True,
                     },
                 }
-            except Exception:
-                logger.exception("Unhandled exception in class GuardedTool.arun()")
-                raise

@@ -1,12 +1,14 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import pytest
 from httpx import AsyncClient
-from langflow.memory import aadd_messagetables
 
 # Assuming you have these imports available
+from langflow.api.v1 import monitor as monitor_api
+from langflow.memory import aadd_messagetables
+from langflow.schema.validators import str_to_timestamp, timestamp_to_str
 from langflow.services.auth.utils import get_auth_service
 from langflow.services.database.models.flow.model import Flow
 from langflow.services.database.models.message import MessageCreate, MessageRead, MessageUpdate
@@ -117,6 +119,30 @@ async def created_messages(session, active_user):  # noqa: ARG001
 
 
 @pytest.fixture
+async def timestamped_messages(active_user):
+    async with session_scope() as session:
+        flow = Flow(name="test_flow_for_message_ordering", user_id=active_user.id, data={"nodes": [], "edges": []})
+        session.add(flow)
+        await session.flush()
+
+        base_timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        messages = [
+            MessageCreate(
+                text=f"Message {index}",
+                sender="User",
+                sender_name="User",
+                session_id="ordered-session",
+                timestamp=base_timestamp + timedelta(minutes=index),
+            )
+            for index in range(3)
+        ]
+        messagetables = [MessageTable.model_validate(message, from_attributes=True) for message in messages]
+        for message in messagetables:
+            message.flow_id = flow.id
+        return await aadd_messagetables(messagetables, session)
+
+
+@pytest.fixture
 async def created_messages_multiple_sessions(session, active_user):  # noqa: ARG001
     """Create messages across multiple distinct sessions for bulk-delete testing."""
     async with session_scope() as _session:
@@ -184,6 +210,42 @@ async def test_get_messages_does_not_return_other_users_messages(
     assert str(cross_user_messages["owned_message"].id) not in other_returned_ids
 
 
+@pytest.mark.usefixtures("timestamped_messages")
+async def test_get_messages_defaults_to_timestamp_ascending(client: AsyncClient, logged_in_headers):
+    response = await client.get(
+        "api/v1/monitor/messages",
+        headers=logged_in_headers,
+        params={"session_id": "ordered-session"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [message["text"] for message in response.json()] == ["Message 0", "Message 1", "Message 2"]
+
+
+@pytest.mark.usefixtures("timestamped_messages")
+async def test_get_messages_supports_descending_order_with_pagination(client: AsyncClient, logged_in_headers):
+    response = await client.get(
+        "api/v1/monitor/messages",
+        headers=logged_in_headers,
+        params={"session_id": "ordered-session", "order": "DESC", "limit": 2, "offset": 1},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [message["text"] for message in response.json()] == ["Message 1", "Message 0"]
+
+
+@pytest.mark.usefixtures("timestamped_messages")
+async def test_get_messages_rejects_invalid_order_direction(client: AsyncClient, logged_in_headers):
+    response = await client.get(
+        "api/v1/monitor/messages",
+        headers=logged_in_headers,
+        params={"session_id": "ordered-session", "order": "sideways"},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "Invalid order direction: sideways"
+
+
 @pytest.mark.api_key_required
 async def test_update_message(client: AsyncClient, logged_in_headers, created_message):
     message_id = created_message.id
@@ -194,6 +256,144 @@ async def test_update_message(client: AsyncClient, logged_in_headers, created_me
     assert response.status_code == 200, response.text
     updated_message = MessageRead(**response.json())
     assert updated_message.text == "Updated content"
+
+
+async def test_update_message_syncs_langfuse_feedback(
+    client: AsyncClient, logged_in_headers, created_message, monkeypatch
+):
+    async with session_scope() as session:
+        db_message = await session.get(MessageTable, created_message.id)
+        assert db_message is not None
+        db_message.run_id = UUID("467ca2ce-4a57-40ce-a911-94ac679d8a79")
+        db_message.session_metadata = {"langfuse_trace_id": "81955a84cb1a1a096639ba1612a48ac0"}
+        session.add(db_message)
+        await session.flush()
+
+    captured = {}
+
+    def fake_sync(**kwargs):
+        captured.update(
+            {
+                "message_id": str(kwargs["message_id"]),
+                "trace_id": kwargs["trace_id"],
+                "positive_feedback": kwargs["positive_feedback"],
+            }
+        )
+
+    monkeypatch.setattr(monitor_api, "sync_feedback_score", fake_sync)
+    monkeypatch.setattr(monitor_api, "_langfuse_feedback_sync_enabled", lambda: True)
+
+    message_update = MessageUpdate(properties={"positive_feedback": True})
+    response = await client.put(
+        f"api/v1/monitor/messages/{created_message.id}",
+        json=message_update.model_dump(exclude_none=True),
+        headers=logged_in_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured == {
+        "message_id": str(created_message.id),
+        "trace_id": "81955a84cb1a1a096639ba1612a48ac0",
+        "positive_feedback": True,
+    }
+
+
+async def test_update_message_does_not_sync_langfuse_feedback_without_langfuse_trace_id(
+    client: AsyncClient, logged_in_headers, created_message, monkeypatch
+):
+    async with session_scope() as session:
+        db_message = await session.get(MessageTable, created_message.id)
+        assert db_message is not None
+        db_message.run_id = UUID("467ca2ce-4a57-40ce-a911-94ac679d8a79")
+        db_message.session_metadata = {}
+        session.add(db_message)
+        await session.flush()
+
+    sync_called = False
+
+    def fake_sync(**kwargs):  # noqa: ARG001
+        nonlocal sync_called
+        sync_called = True
+
+    monkeypatch.setattr(monitor_api, "sync_feedback_score", fake_sync)
+    monkeypatch.setattr(monitor_api, "_langfuse_feedback_sync_enabled", lambda: True)
+
+    message_update = MessageUpdate(properties={"positive_feedback": True})
+    response = await client.put(
+        f"api/v1/monitor/messages/{created_message.id}",
+        json=message_update.model_dump(exclude_none=True),
+        headers=logged_in_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert sync_called is False
+
+
+async def test_update_message_does_not_sync_when_langfuse_feedback_disabled(
+    client: AsyncClient, logged_in_headers, created_message, monkeypatch
+):
+    async with session_scope() as session:
+        db_message = await session.get(MessageTable, created_message.id)
+        assert db_message is not None
+        db_message.session_metadata = {"langfuse_trace_id": "81955a84cb1a1a096639ba1612a48ac0"}
+        session.add(db_message)
+        await session.flush()
+
+    sync_called = False
+
+    def fake_sync(**kwargs):  # noqa: ARG001
+        nonlocal sync_called
+        sync_called = True
+
+    monkeypatch.setattr(monitor_api, "sync_feedback_score", fake_sync)
+    monkeypatch.setattr(monitor_api, "_langfuse_feedback_sync_enabled", lambda: False)
+
+    message_update = MessageUpdate(properties={"positive_feedback": True})
+    response = await client.put(
+        f"api/v1/monitor/messages/{created_message.id}",
+        json=message_update.model_dump(exclude_none=True),
+        headers=logged_in_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert sync_called is False
+
+
+async def test_update_message_deletes_langfuse_feedback_when_cleared(
+    client: AsyncClient, logged_in_headers, created_message, monkeypatch
+):
+    async with session_scope() as session:
+        db_message = await session.get(MessageTable, created_message.id)
+        assert db_message is not None
+        db_message.session_metadata = {"langfuse_trace_id": "81955a84cb1a1a096639ba1612a48ac0"}
+        db_message.properties = {"positive_feedback": True}
+        session.add(db_message)
+        await session.flush()
+
+    delete_calls = []
+    sync_called = False
+
+    def fake_delete(**kwargs):
+        delete_calls.append(str(kwargs["message_id"]))
+
+    def fake_sync(**kwargs):  # noqa: ARG001
+        nonlocal sync_called
+        sync_called = True
+
+    monkeypatch.setattr(monitor_api, "delete_feedback_score", fake_delete)
+    monkeypatch.setattr(monitor_api, "sync_feedback_score", fake_sync)
+    monkeypatch.setattr(monitor_api, "_langfuse_feedback_sync_enabled", lambda: True)
+
+    message_update = MessageUpdate(properties={"positive_feedback": None})
+    response = await client.put(
+        f"api/v1/monitor/messages/{created_message.id}",
+        json=message_update.model_dump(),
+        headers=logged_in_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert delete_calls == [str(created_message.id)]
+    assert sync_called is False
 
 
 @pytest.mark.api_key_required
@@ -313,12 +513,11 @@ async def test_successfully_update_session_id(client, logged_in_headers, created
     for message in messages:
         assert message["session_id"] == new_session_id
         response_timestamp = message["timestamp"]
-        timestamp = datetime.strptime(response_timestamp, "%Y-%m-%d %H:%M:%S %Z").replace(tzinfo=timezone.utc)
-        timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S %Z")
+        timestamp = str_to_timestamp(response_timestamp)
+        timestamp_str = timestamp_to_str(timestamp)
         assert timestamp_str == response_timestamp
 
-    # Check if the messages ordered by timestamp are in the correct order
-    # User, User, AI
+    # Messages default to timestamp ASC (oldest first): User, User, AI
     assert messages[0]["sender"] == "User"
     assert messages[1]["sender"] == "User"
     assert messages[2]["sender"] == "AI"

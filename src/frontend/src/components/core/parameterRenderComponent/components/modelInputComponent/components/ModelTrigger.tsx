@@ -6,6 +6,20 @@ import { PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/utils/utils";
 import { ModelOption, SelectedModel } from "../types";
 
+/**
+ * The trigger collapses into a single "Setup Provider" call to action — which
+ * already opens the provider manager, so no extra affordance belongs next to it.
+ */
+export const isSetupProviderState = ({
+  hasEnabledProviders,
+  showEmptyState,
+  optionCount,
+}: {
+  hasEnabledProviders: boolean;
+  showEmptyState: boolean;
+  optionCount: number;
+}) => !hasEnabledProviders && !showEmptyState && optionCount === 0;
+
 interface ModelTriggerProps {
   open: boolean;
   disabled: boolean;
@@ -48,7 +62,13 @@ const ModelTrigger = ({
   // Check if we're in empty state mode (showEmptyState=true and no options)
   const isEmptyStateMode = showEmptyState && options.length === 0;
 
-  if (!hasEnabledProviders && !showEmptyState && options.length === 0) {
+  if (
+    isSetupProviderState({
+      hasEnabledProviders,
+      showEmptyState,
+      optionCount: options.length,
+    })
+  ) {
     return (
       <Button
         variant="outline"
@@ -57,10 +77,14 @@ const ModelTrigger = ({
         onClick={onOpenManageProviders}
       >
         <ForwardedIconComponent
-          name="Brain"
+          name="BrainCircuit"
           className="h-4 w-4 flex-shrink-0 text-muted-foreground"
         />
-        <div className="text-[13px] text-muted-foreground">{placeholder}</div>
+        <div className="text-[13px] text-muted-foreground">
+          {placeholder === "Setup Provider"
+            ? t("model.setupProvider")
+            : placeholder}
+        </div>
       </Button>
     );
   }
@@ -69,7 +93,7 @@ const ModelTrigger = ({
     <div className="flex w-full flex-col">
       <PopoverTrigger asChild>
         <Button
-          disabled={disabled || (options.length === 0 && !showEmptyState)}
+          disabled={disabled}
           variant="primary"
           size="xs"
           role="combobox"
@@ -78,7 +102,7 @@ const ModelTrigger = ({
           data-testid={id}
           className={cn(
             "dropdown-component-false-outline py-2",
-            "no-focus-visible w-full justify-between font-normal disabled:bg-muted disabled:text-muted-foreground",
+            "focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-2 w-full justify-between font-normal disabled:bg-muted disabled:text-muted-foreground",
           )}
         >
           <span
@@ -91,7 +115,7 @@ const ModelTrigger = ({
                 t("component.receivingInput")
               ) : isEmptyStateMode ? (
                 <div className="truncate text-muted-foreground">
-                  No models enabled
+                  {t("model.noModelsEnabled")}
                 </div>
               ) : (
                 <div
@@ -100,7 +124,7 @@ const ModelTrigger = ({
                     !selectedModel?.name && "text-muted-foreground",
                   )}
                 >
-                  {selectedModel?.name || "Select a model"}
+                  {selectedModel?.name || t("model.selectModel")}
                 </div>
               )}
             </span>

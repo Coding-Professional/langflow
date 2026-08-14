@@ -1,13 +1,18 @@
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from lfx.components.models_and_agents.policies.guard_sync_utils import GENERATED_GUARD_INFO_PREFIX
+from lfx.components.models_and_agents.policies.module_utils import ensure_toolguard_module_path_compat
 from lfx.components.models_and_agents.policies_component import (
     MODE_GENERATE,
     MODE_GUARD,
     STEP2,
     PoliciesComponent,
 )
+
+from tests.base import ComponentTestBaseWithoutClient
 
 
 @pytest.fixture
@@ -36,83 +41,288 @@ def mock_component(mock_tool):
         return component
 
 
-@pytest.mark.asyncio
-async def test_cache_mode_success(mock_component, mock_tool):
-    """Test PoliciesComponent in cache mode with valid cached guards."""
-    code_dir = mock_component.work_dir / STEP2
+def _make_fake_tg(**overrides):
+    """Build a fake toolguard-imports dict for use with `_import_toolguard` patching.
 
-    # Mock the cache directory exists and toolguard loading
-    with (
-        patch.object(Path, "exists", return_value=True),
-        patch("lfx.components.models_and_agents.policies_component.load_toolguards") as mock_load_guards,
-        patch.object(mock_component, "make_toolguard_result") as mock_make_result,
-        patch("lfx.components.models_and_agents.policies_component.load_toolguards_from_memory") as mock_load_memory,
-        patch("lfx.components.models_and_agents.policies_component.GuardedTool") as mock_guarded_tool,
+    Mirrors the keys returned by `PoliciesComponent._import_toolguard()`; tests
+    can override individual entries to assert specific call wiring.
+    """
+    fake = {
+        "PolicySpecOptions": MagicMock(),
+        "ToolGuardsCodeGenerationResult": MagicMock(),
+        "generate_guard_specs": MagicMock(),
+        "generate_guards_code": MagicMock(),
+        "langchain_tools_to_openapi": MagicMock(),
+        "load_toolguards_from_memory": MagicMock(),
+        "RESULTS_FILENAME": "results.json",
+        "sync_generated_guard_code_inputs": MagicMock(),
+        "GuardedTool": MagicMock(),
+        "LangchainModelWrapper": MagicMock(),
+    }
+    fake.update(overrides)
+    return fake
+
+
+def _generated_guard_field(name: str, value: str) -> dict:
+    return {
+        "type": "code",
+        "dynamic": True,
+        "info": f"{GENERATED_GUARD_INFO_PREFIX}{name}",
+        "value": value,
+    }
+
+
+class TestPoliciesComponent(ComponentTestBaseWithoutClient):
+    @pytest.fixture
+    def component_class(self):
+        return PoliciesComponent
+
+    @pytest.fixture
+    def default_kwargs(self):
+        return {"enabled": False, "in_tools": []}
+
+    @pytest.fixture
+    def file_names_mapping(self):
+        return []
+
+    async def test_component_update_preserves_only_generated_guard_fields(self, component_class, default_kwargs):
+        """A Breaking component update must retain guard code stored in the flow."""
+        component = await self.component_setup(component_class, default_kwargs)
+        result_field = _generated_guard_field("result.json", "persisted result")
+        guard_field = _generated_guard_field("test_project/guard.py", "persisted guard")
+        current_frontend_node = {
+            "display_name": "Policies",
+            "template": {
+                "code": {"type": "code", "value": "old component code"},
+                "project": {"type": "str", "value": "test_project"},
+                "removed_input": {"type": "str", "value": "do not preserve"},
+                "dynamic_lookalike": {
+                    "type": "code",
+                    "dynamic": True,
+                    "info": "User-defined dynamic code",
+                    "value": "do not preserve",
+                },
+                "result.json": result_field,
+                "test_project/guard.py": guard_field,
+            },
+        }
+        new_frontend_node = {
+            "display_name": "Policies",
+            "template": {
+                "code": {"type": "code", "value": "new component code"},
+                "project": {"type": "str", "value": "my_project"},
+                "new_input": {"type": "str", "value": "new default"},
+            },
+        }
+
+        with patch.object(PoliciesComponent, "_import_toolguard", side_effect=ImportError) as mock_import:
+            result = await component.update_frontend_node(new_frontend_node, current_frontend_node)
+
+        mock_import.assert_not_called()
+        assert result["template"]["result.json"] == result_field
+        assert result["template"]["test_project/guard.py"] == guard_field
+        assert "removed_input" not in result["template"]
+        assert "dynamic_lookalike" not in result["template"]
+        assert result["template"]["new_input"]["value"] == "new default"
+
+    async def test_component_update_makes_model_optional_for_guard_mode(self, component_class, default_kwargs):
+        """Updating an imported Guard node must normalize its static model requirement."""
+        component = await self.component_setup(component_class, default_kwargs)
+        current_frontend_node = {
+            "display_name": "Policies",
+            "template": {
+                "code": {"type": "code", "value": "old component code"},
+                "mode": {"type": "tab", "value": MODE_GUARD},
+                "model": {"type": "model", "value": [], "required": True},
+            },
+        }
+        new_frontend_node = {
+            "display_name": "Policies",
+            "template": {
+                "code": {"type": "code", "value": "new component code"},
+                "mode": {"type": "tab", "value": MODE_GENERATE},
+                "model": {"type": "model", "value": [], "required": True},
+            },
+        }
+
+        result = await component.update_frontend_node(new_frontend_node, current_frontend_node)
+
+        assert result["template"]["mode"]["value"] == MODE_GUARD
+        assert result["template"]["model"]["required"] is False
+
+    @pytest.mark.parametrize(
+        ("stored_mode", "field_name", "field_value", "expected_required"),
+        [
+            (MODE_GUARD, "mode", MODE_GENERATE, True),
+            (MODE_GENERATE, "mode", MODE_GUARD, False),
+            (MODE_GUARD, "model", [], False),
+        ],
+    )
+    def test_update_build_config_syncs_model_requirement(
+        self, mock_component, stored_mode, field_name, field_value, expected_required
     ):
-        mock_tg_result = MagicMock()
-        mock_make_result.return_value = mock_tg_result
-        mock_tg_runtime = MagicMock()
-        mock_load_memory.return_value = mock_tg_runtime
-        mock_guarded_instance = MagicMock()
-        mock_guarded_tool.return_value = mock_guarded_instance
+        """Activity controls the model gate, including model refreshes on flow load."""
+        mock_component.mode = stored_mode
+        build_config = {
+            "mode": {"value": stored_mode},
+            "model": {"required": not expected_required},
+        }
+        sync_guard_inputs = MagicMock(side_effect=lambda **kwargs: kwargs["build_config"])
+        fake_tg = _make_fake_tg(sync_generated_guard_code_inputs=sync_guard_inputs)
 
-        result = await mock_component.guard_tools()
+        with (
+            patch(
+                "lfx.components.models_and_agents.policies_component.update_model_options_in_build_config",
+                side_effect=lambda **kwargs: kwargs["build_config"],
+            ),
+            patch.object(PoliciesComponent, "_import_toolguard", return_value=fake_tg),
+        ):
+            result = mock_component.update_build_config(build_config, field_value, field_name)
 
-        # Verify load_toolguards was called during validation
-        mock_load_guards.assert_called_once_with(code_dir)
+        assert result["model"]["required"] is expected_required
+        sync_guard_inputs.assert_called_once()
 
-        # Verify make_toolguard_result was called
-        mock_make_result.assert_called_once()
+    @pytest.mark.parametrize("unsupported_mode", [None, "", "unsupported"])
+    def test_update_build_config_rejects_unsupported_mode(self, mock_component, unsupported_mode):
+        """An invalid Activity value must not relax the model requirement."""
+        build_config = {
+            "mode": {"value": MODE_GENERATE},
+            "model": {"required": True},
+        }
 
-        # Verify load_toolguards_from_memory was called with the result
-        mock_load_memory.assert_called_once_with(mock_tg_result)
+        with (
+            patch(
+                "lfx.components.models_and_agents.policies_component.update_model_options_in_build_config",
+                side_effect=lambda **kwargs: kwargs["build_config"],
+            ),
+            patch.object(PoliciesComponent, "_import_toolguard") as mock_import,
+            pytest.raises(ValueError, match="unsupported activity mode"),
+        ):
+            mock_component.update_build_config(build_config, unsupported_mode, "mode")
 
-        # Verify GuardedTool was created for each tool
-        assert mock_guarded_tool.call_count == len(mock_component.in_tools)
-        mock_guarded_tool.assert_called_with(mock_tool, mock_component.in_tools, mock_tg_runtime)
+        assert build_config["model"]["required"] is True
+        mock_import.assert_not_called()
 
-        # Verify result contains guarded tools
-        assert len(result) == 1
-        assert result[0] == mock_guarded_instance
+    @pytest.mark.parametrize("unsupported_mode", [None, "", "unsupported"])
+    async def test_guard_tools_rejects_unsupported_mode(self, mock_component, unsupported_mode):
+        """Guard execution must reject malformed Activity values before loading ToolGuard."""
+        mock_component.mode = unsupported_mode
+
+        with (
+            patch.object(PoliciesComponent, "_code_execution_allowed", return_value=True),
+            patch.object(PoliciesComponent, "_import_toolguard") as mock_import,
+            patch.object(mock_component, "generate") as mock_generate,
+            patch.object(mock_component, "make_toolguard_result") as mock_make_result,
+            pytest.raises(ValueError, match="unsupported activity mode"),
+        ):
+            await mock_component.guard_tools()
+
+        mock_import.assert_not_called()
+        mock_generate.assert_not_called()
+        mock_make_result.assert_not_called()
+
+    @pytest.mark.parametrize("missing_settings_module", ["lfx.services", "lfx.services.deps"])
+    def test_code_execution_allowed_for_standalone_missing_settings_layer(self, missing_settings_module):
+        """Standalone lfx stays allowed when its settings layer is absent."""
+        standalone_error = ModuleNotFoundError(
+            f"No module named '{missing_settings_module}'", name=missing_settings_module
+        )
+        with patch("builtins.__import__", side_effect=standalone_error):
+            assert PoliciesComponent._code_execution_allowed() is True
+
+    def test_code_execution_allowed_propagates_nested_import_failure(self):
+        """A dependency failure inside the settings layer must not enable code execution."""
+        dependency_error = ModuleNotFoundError("No module named 'dependency'", name="dependency")
+        with (
+            patch("builtins.__import__", side_effect=dependency_error),
+            pytest.raises(ModuleNotFoundError, match="dependency"),
+        ):
+            PoliciesComponent._code_execution_allowed()
+
+    @pytest.mark.parametrize(
+        "settings_service",
+        [
+            None,
+            SimpleNamespace(),
+            SimpleNamespace(settings=None),
+            SimpleNamespace(settings=SimpleNamespace()),
+        ],
+    )
+    def test_code_execution_allowed_denies_incomplete_settings(self, monkeypatch, settings_service):
+        """Only an explicit allow_custom_components setting permits guard-code execution."""
+        monkeypatch.setattr("lfx.services.deps.get_settings_service", lambda: settings_service)
+
+        assert PoliciesComponent._code_execution_allowed() is False
 
 
 @pytest.mark.asyncio
-async def test_cache_mode_directory_not_found(mock_component):
-    """Test PoliciesComponent in cache mode when cache directory doesn't exist."""
-    # Mock the cache directory does not exist
+async def test_guard_tools_blocked_when_custom_components_disabled(mock_component, monkeypatch):
+    """ToolGuard guard execution must be refused under allow_custom_components=False.
+
+    Regression test: the guard code comes from client-editable CodeInput
+    template values that bypass the custom-component hash gate, so a locked-down
+    deployment must refuse to execute it. The refusal happens before any toolguard
+    import/exec.
+    """
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "lfx.services.deps.get_settings_service",
+        lambda: SimpleNamespace(settings=SimpleNamespace(allow_custom_components=False)),
+    )
+
+    # The refusal must happen before any toolguard runtime is imported/exec'd.
     with (
-        patch.object(Path, "exists", return_value=False),
-        pytest.raises(ValueError, match="Cache directory not found"),
+        patch.object(PoliciesComponent, "_import_toolguard") as mock_import,
+        pytest.raises(ValueError, match="allow_custom_components"),
+    ):
+        await mock_component.guard_tools()
+    mock_import.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_guard_tools_allowed_when_custom_components_enabled(mock_component, monkeypatch):
+    """ToolGuard guard execution must reach the runtime when allow_custom_components=True.
+
+    Pins the allow side of the gate: with the flag enabled, guard_tools() must get
+    past _code_execution_allowed() and import the toolguard runtime. Without this,
+    a future flip of the default would silently bypass the security gate and only
+    the blocked path would be covered.
+    """
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "lfx.services.deps.get_settings_service",
+        lambda: SimpleNamespace(settings=SimpleNamespace(allow_custom_components=True)),
+    )
+
+    fake_tg = _make_fake_tg()
+    fake_tg["load_toolguards_from_memory"].return_value = MagicMock()
+    fake_tg["GuardedTool"].return_value = MagicMock()
+
+    with (
+        patch.object(PoliciesComponent, "_import_toolguard", return_value=fake_tg) as mock_import,
+        patch.object(mock_component, "make_toolguard_result", return_value=MagicMock()),
     ):
         await mock_component.guard_tools()
 
+    mock_import.assert_called()
 
-@pytest.mark.asyncio
-async def test_cache_mode_file_not_found(mock_component):
-    """Test PoliciesComponent in cache mode when required files are missing."""
-    # Mock the cache directory exists but files are missing
+
+async def test_guard_mode_requires_tools(mock_component):
+    """Guard mode must still reject an empty tool list before loading persisted code."""
+    mock_component.in_tools = []
+    fake_tg = _make_fake_tg()
+
     with (
-        patch.object(Path, "exists", return_value=True),
-        patch("lfx.components.models_and_agents.policies_component.load_toolguards") as mock_load_guards,
+        patch.object(PoliciesComponent, "_import_toolguard", return_value=fake_tg),
+        patch.object(mock_component, "make_toolguard_result") as mock_make_result,
+        pytest.raises(ValueError, match="in_tools cannot be empty"),
     ):
-        mock_load_guards.side_effect = FileNotFoundError("Guard file not found")
+        await mock_component.guard_tools()
 
-        with pytest.raises(ValueError, match="Required guard code files missing"):
-            await mock_component.guard_tools()
-
-
-@pytest.mark.asyncio
-async def test_cache_mode_corrupted_cache(mock_component):
-    """Test PoliciesComponent in cache mode when cached code is corrupted."""
-    # Mock the cache directory exists but code is corrupted
-    with (
-        patch.object(Path, "exists", return_value=True),
-        patch("lfx.components.models_and_agents.policies_component.load_toolguards") as mock_load_guards,
-    ):
-        mock_load_guards.side_effect = Exception("Invalid Python syntax")
-
-        with pytest.raises(ValueError, match="Failed to load guard code"):
-            await mock_component.guard_tools()
+    mock_make_result.assert_not_called()
+    fake_tg["load_toolguards_from_memory"].assert_not_called()
 
 
 # @pytest.mark.asyncio
@@ -163,29 +373,31 @@ async def test_inenabled_returns_original_tools(mock_component, mock_tool):
 async def test_generate_mode_validation_errors(mock_component):
     """Test PoliciesComponent in generate mode with validation errors."""
     mock_component.mode = MODE_GENERATE
+    fake_tg = _make_fake_tg()
 
-    # Test empty project
-    mock_component.project = ""
-    with pytest.raises(ValueError):  # noqa: PT011
-        await mock_component.guard_tools()
+    with patch.object(PoliciesComponent, "_import_toolguard", return_value=fake_tg):
+        # Test empty project
+        mock_component.project = ""
+        with pytest.raises(ValueError):  # noqa: PT011
+            await mock_component.guard_tools()
 
-    # Test empty policies
-    mock_component.project = "test_project"
-    mock_component.policies = []
-    with pytest.raises(ValueError, match="policies cannot be empty"):
-        await mock_component.guard_tools()
+        # Test empty policies
+        mock_component.project = "test_project"
+        mock_component.policies = []
+        with pytest.raises(ValueError, match="policies cannot be empty"):
+            await mock_component.guard_tools()
 
-    # Test empty tools
-    mock_component.policies = ["Policy 1"]
-    mock_component.in_tools = []
-    with pytest.raises(ValueError, match="in_tools cannot be empty"):
-        await mock_component.guard_tools()
+        # Test empty tools
+        mock_component.policies = ["Policy 1"]
+        mock_component.in_tools = []
+        with pytest.raises(ValueError, match="in_tools cannot be empty"):
+            await mock_component.guard_tools()
 
-    # Test missing model
-    mock_component.in_tools = [MagicMock()]
-    mock_component.model = None
-    with pytest.raises(ValueError, match="model or api_key cannot be empty"):
-        await mock_component.guard_tools()
+        # Test missing model
+        mock_component.in_tools = [MagicMock()]
+        mock_component.model = None
+        with pytest.raises(ValueError, match="model cannot be empty"):
+            await mock_component.guard_tools()
 
     # # Test non-recommended model
     # mock_component.model = [{"name": "gpt-3.5-turbo", "provider": "OpenAI"}]
@@ -244,43 +456,220 @@ def test_in_recommended_models(mock_component):
     assert mock_component.in_recommended_models("claude-3") is False
 
 
-@pytest.mark.asyncio
-async def test_verify_cached_guards_error_messages(mock_component):
-    """Test that _verify_cached_guards provides helpful error messages."""
-    code_dir = mock_component.work_dir / STEP2
+def test_template_field_key_normalizes_separators():
+    """Node-template keys are POSIX; OS-separator file names must normalize to match.
 
-    # Test directory not found error message
-    with patch.object(Path, "exists", return_value=False):
-        with pytest.raises(ValueError, match="Cache directory not found") as exc_info:
-            mock_component._verify_cached_guards(code_dir)
+    Regression for #13727: on Windows the toolguard result stores ``file_name`` as
+    a Path whose ``str()`` uses backslashes, while ``sync_generated_guard_code_inputs``
+    keys the template by ``Path.as_posix()`` (forward slashes). The lookup must
+    normalize so it matches on every platform.
+    """
+    # Forward-slash input is unchanged.
+    assert PoliciesComponent._template_field_key("proj/fetch_content/guard.py") == "proj/fetch_content/guard.py"
+    # Backslash input (what str(WindowsPath(...)) yields) normalizes to forward slashes.
+    assert PoliciesComponent._template_field_key("proj\\fetch_content\\guard.py") == "proj/fetch_content/guard.py"
+    # Path inputs normalize too.
+    assert PoliciesComponent._template_field_key(Path("proj/fetch_content/guard.py")) == "proj/fetch_content/guard.py"
+    # Single-segment names (e.g. result.json) are unaffected.
+    assert PoliciesComponent._template_field_key("result.json") == "result.json"
 
-        assert "Generate" in str(exc_info.value)
-        assert str(code_dir) in str(exc_info.value)
 
-    # Test file not found error message
+def _fake_file_twin(file_name):
+    """A stand-in for toolguard's FileTwin: a ``file_name`` plus assignable ``content``."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(file_name=file_name, content=None)
+
+
+def test_toolguard_module_path_compat_normalizes_windows_separators():
+    """Patch the ToolGuard 0.2.21 converter without changing FileTwin types."""
+    runtime_module = ModuleType("fake_toolguard_runtime")
+
+    def legacy_converter(path):
+        return str(path).removesuffix(".py").replace("/", ".")
+
+    runtime_module._file_to_module_name = legacy_converter
+
+    ensure_toolguard_module_path_compat(runtime_module)
+
+    assert runtime_module._file_to_module_name is not legacy_converter
+    assert runtime_module._file_to_module_name("proj/fetch_content/guard.py") == "proj.fetch_content.guard"
+    assert runtime_module._file_to_module_name(r"proj\fetch_content\guard.py") == "proj.fetch_content.guard"
+
+
+def test_toolguard_module_path_compat_preserves_fixed_converter():
+    """Do not replace the converter after a fixed ToolGuard release is installed."""
+    runtime_module = ModuleType("fixed_toolguard_runtime")
+
+    def fixed_converter(path):
+        return str(path).removesuffix(".py").replace("\\", ".").replace("/", ".")
+
+    runtime_module._file_to_module_name = fixed_converter
+
+    ensure_toolguard_module_path_compat(runtime_module)
+
+    assert runtime_module._file_to_module_name is fixed_converter
+
+
+def test_toolguard_module_path_compat_preserves_unknown_converter():
+    """Do not replace a future ToolGuard converter with unknown behavior."""
+    runtime_module = ModuleType("unknown_toolguard_runtime")
+
+    def unknown_converter(path):
+        return str(path).removesuffix(".py").replace("\\", "/")
+
+    runtime_module._file_to_module_name = unknown_converter
+
+    ensure_toolguard_module_path_compat(runtime_module)
+
+    assert runtime_module._file_to_module_name is unknown_converter
+
+
+def test_toolguard_module_path_compat_preserves_raising_converter():
+    """Do not let an unsupported private converter abort ToolGuard imports."""
+    runtime_module = ModuleType("raising_toolguard_runtime")
+
+    def raising_converter(_path):
+        msg = "unsupported converter contract"
+        raise RuntimeError(msg)
+
+    runtime_module._file_to_module_name = raising_converter
+
+    ensure_toolguard_module_path_compat(runtime_module)
+
+    assert runtime_module._file_to_module_name is raising_converter
+
+
+async def test_guard_mode_loads_persisted_template_without_cache_directory(mock_component, mock_tool, tmp_path):
+    """Guard mode must load persisted template code without requiring the local generation cache.
+
+    The complete node-template result remains authoritative when ``Step_2`` is
+    absent. Windows-style file names are included to retain the separator
+    compatibility regression coverage from #14374.
+    """
+    from types import SimpleNamespace
+
+    # file_name values as they arrive from the result model on Windows (backslashes).
+    types_fn = "proj\\proj_types.py"
+    api_fn = "proj\\proj_api.py"
+    impl_fn = "proj\\proj_api_impl.py"
+    guard_fn = "proj\\fetch_content\\guard.py"
+    item_fn = "proj\\fetch_content\\guard_allowed_url_domains.py"
+
+    fake_result = SimpleNamespace(
+        domain=SimpleNamespace(
+            app_types=_fake_file_twin(types_fn),
+            app_api=_fake_file_twin(api_fn),
+            app_api_impl=_fake_file_twin(impl_fn),
+        ),
+        tools={
+            "fetch_content": SimpleNamespace(
+                guard_file=_fake_file_twin(guard_fn),
+                item_guard_files=[_fake_file_twin(item_fn)],
+            )
+        },
+    )
+
+    # Template keyed by POSIX paths, exactly as sync_generated_guard_code_inputs writes them.
+    attrs = {
+        "result.json": {"value": "{}"},
+        "proj/proj_types.py": {"value": "types-content"},
+        "proj/proj_api.py": {"value": "api-content"},
+        "proj/proj_api_impl.py": {"value": "impl-content"},
+        "proj/fetch_content/guard.py": {"value": "guard-content"},
+        "proj/fetch_content/guard_allowed_url_domains.py": {"value": "item-content"},
+    }
+
+    disk_loader = MagicMock()
+    fake_tg = _make_fake_tg(RESULTS_FILENAME="result.json", load_toolguards=disk_loader)
+    fake_tg["ToolGuardsCodeGenerationResult"].model_validate_json.return_value = fake_result
+    mock_tg_runtime = MagicMock()
+    fake_tg["load_toolguards_from_memory"].return_value = mock_tg_runtime
+    mock_guarded_instance = MagicMock()
+    fake_tg["GuardedTool"].return_value = mock_guarded_instance
+
+    mock_component.get_vertex = MagicMock(return_value=SimpleNamespace(data={"node": {"template": attrs}}))
+    mock_component.model = None
+    mock_component.policies = []
+
     with (
-        patch.object(Path, "exists", return_value=True),
-        patch("lfx.components.models_and_agents.policies_component.load_toolguards") as mock_load,
+        patch("lfx.components.models_and_agents.policies_component.TOOLGUARD_WORK_DIR", tmp_path),
+        patch.object(PoliciesComponent, "_import_toolguard", return_value=fake_tg),
+        patch.object(mock_component, "validate_before_generate") as mock_validate,
+        patch.object(mock_component, "build_model") as mock_build_model,
     ):
-        mock_load.side_effect = FileNotFoundError("Missing file")
+        assert not (mock_component.work_dir / STEP2).exists()
+        result = await mock_component.guard_tools()
 
-        with pytest.raises(ValueError, match="Required guard code files missing") as exc_info:
-            mock_component._verify_cached_guards(code_dir)
+    assert fake_result.domain.app_types.content == "types-content"
+    assert fake_result.domain.app_api.content == "api-content"
+    assert fake_result.domain.app_api_impl.content == "impl-content"
+    assert fake_result.tools["fetch_content"].guard_file.content == "guard-content"
+    assert fake_result.tools["fetch_content"].item_guard_files[0].content == "item-content"
+    disk_loader.assert_not_called()
+    fake_tg["load_toolguards_from_memory"].assert_called_once_with(fake_result)
+    fake_tg["GuardedTool"].assert_called_once_with(mock_tool, mock_component.in_tools, mock_tg_runtime)
+    mock_validate.assert_not_called()
+    mock_build_model.assert_not_called()
+    assert result == [mock_guarded_instance]
 
-        assert "Generate" in str(exc_info.value)
 
-    # Test general error message
+def test_make_toolguard_result_missing_field_raises_clear_error(mock_component):
+    """A missing generated field yields a clear ValueError, not a NoneType subscript.
+
+    Before #13727's fix a missing key surfaced as
+    ``'NoneType' object is not subscriptable``; it must now point the user at
+    Generate mode instead.
+    """
+    from types import SimpleNamespace
+
+    fake_result = SimpleNamespace(
+        domain=SimpleNamespace(
+            app_types=_fake_file_twin("proj/proj_types.py"),
+            app_api=_fake_file_twin("proj/proj_api.py"),
+            app_api_impl=_fake_file_twin("proj/proj_api_impl.py"),
+        ),
+        tools={},
+    )
+
+    # app_types key is intentionally absent from the template.
+    attrs = {
+        "result.json": {"value": "{}"},
+        "proj/proj_api.py": {"value": "api-content"},
+        "proj/proj_api_impl.py": {"value": "impl-content"},
+    }
+
+    fake_tg = _make_fake_tg(RESULTS_FILENAME="result.json")
+    fake_tg["ToolGuardsCodeGenerationResult"].model_validate_json.return_value = fake_result
+
+    mock_component.get_vertex = MagicMock(return_value=SimpleNamespace(data={"node": {"template": attrs}}))
+
     with (
-        patch.object(Path, "exists", return_value=True),
-        patch("lfx.components.models_and_agents.policies_component.load_toolguards") as mock_load,
+        patch.object(PoliciesComponent, "_import_toolguard", return_value=fake_tg),
+        pytest.raises(ValueError, match="missing from the component"),
     ):
-        mock_load.side_effect = RuntimeError("Unexpected error")
+        mock_component.make_toolguard_result()
 
-        with pytest.raises(ValueError, match="Failed to load guard code") as exc_info:
-            mock_component._verify_cached_guards(code_dir)
 
-        assert "corrupted" in str(exc_info.value)
-        assert "Unexpected error" in str(exc_info.value)
+def test_validate_before_generate_allows_empty_api_key(mock_component):
+    """api_key is optional: validation passes when only the model is set.
+
+    The field is declared required=False/advanced=True and credentials often come
+    from the model connection or environment, so requiring api_key here wrongly
+    blocked valid setups (the "model or api_key cannot be empty!" wart in #13727).
+    """
+    mock_component.api_key = ""
+    mock_component.model = [{"name": "gpt-5.1", "provider": "OpenAI"}]
+    # Should not raise.
+    mock_component.validate_before_generate()
+
+
+def test_validate_before_generate_still_requires_model(mock_component):
+    """A missing model is still rejected after relaxing the api_key requirement."""
+    mock_component.api_key = ""
+    mock_component.model = None
+    with pytest.raises(ValueError, match="model cannot be empty"):
+        mock_component.validate_before_generate()
 
 
 # Made with Bob

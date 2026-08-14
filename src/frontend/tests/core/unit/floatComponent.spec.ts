@@ -1,23 +1,16 @@
 import { expect, test } from "../../fixtures";
 import { adjustScreenView } from "../../utils/adjust-screen-view";
-import { awaitBootstrapTest } from "../../utils/await-bootstrap-test";
+import { openBlankFlow } from "../../utils/flow/open-blank-flow";
 import {
-  closeAdvancedOptions,
-  disableInspectPanel,
-  enableInspectPanel,
-  openAdvancedOptions,
+  addParameterToNode,
+  closeParametersPanel,
 } from "../../utils/open-advanced-options";
 
 test(
   "FloatComponent",
   { tag: ["@release", "@workspace"] },
   async ({ page }) => {
-    await awaitBootstrapTest(page);
-
-    await page.waitForSelector('[data-testid="blank-flow"]', {
-      timeout: 30000,
-    });
-    await page.getByTestId("blank-flow").click();
+    await openBlankFlow(page);
     await page.getByTestId("sidebar-search-input").click();
     await page.getByTestId("sidebar-search-input").fill("nvidia");
 
@@ -41,58 +34,20 @@ test(
 
     //add
 
-    await disableInspectPanel(page);
-
     await page.getByTestId("title-NVIDIA").click();
 
-    await openAdvancedOptions(page);
+    // LE-1810: the parameters panel adds the hidden field to the node; the
+    // value is edited on the node itself.
+    await addParameterToNode(page, "seed");
 
-    await page.getByTestId("showseed").click();
-
-    await closeAdvancedOptions(page);
+    await closeParametersPanel(page);
 
     await adjustScreenView(page);
 
-    await page.locator('//*[@id="int_int_seed"]').click();
-    await page.locator('//*[@id="int_int_seed"]').fill("");
-    await page.locator('//*[@id="int_int_seed"]').fill("3");
-
-    let value = await page.locator('//*[@id="int_int_seed"]').inputValue();
-
-    expect(value).toBe("3");
-
-    await page.locator('//*[@id="int_int_seed"]').click();
-    await page.locator('//*[@id="int_int_seed"]').fill("");
-    await page.locator('//*[@id="int_int_seed"]').fill("-3");
-
-    value = await page.locator('//*[@id="int_int_seed"]').inputValue();
-
-    expect(value).toBe("-3");
-
-    const plusButtonLocator = page.locator('//*[@id="int_int_edit_seed"]');
-    const elementCount = await plusButtonLocator?.count();
-    if (elementCount === 0) {
-      expect(true).toBeTruthy();
-
-      await page.locator('//*[@id="int_int_seed"]').click();
-      await page.getByTestId("int_int_seed").fill("");
-
-      await page.locator('//*[@id="int_int_seed"]').fill("3");
-
-      let value = await page.locator('//*[@id="int_int_seed"]').inputValue();
-
-      expect(value).toBe("3");
-
-      await page.locator('//*[@id="int_int_seed"]').click();
-      await page.getByTestId("int_int_seed").fill("");
-
-      await page.locator('//*[@id="int_int_seed"]').fill("-3");
-
-      value = await page.locator('//*[@id="int_int_seed"]').inputValue();
-
-      expect(value).toBe("-3");
-    }
-
-    await enableInspectPanel(page);
+    const seedInput = page.getByTestId("int_int_seed");
+    await seedInput.fill("3");
+    await expect(seedInput).toHaveValue("3");
+    await seedInput.fill("-3");
+    await expect(seedInput).toHaveValue("-3");
   },
 );

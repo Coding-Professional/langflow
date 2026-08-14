@@ -7,8 +7,10 @@ import {
 } from "@chakra-ui/number-input";
 import { MinusIcon, PlusIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { cn } from "@/utils/utils";
 import { handleKeyDown } from "../../../../../utils/reactflowUtils";
+import { getNodeScopedDomId } from "../../helpers/get-node-scoped-dom-id";
 import type { FloatComponentType, InputProps } from "../../types";
 
 export default function FloatComponent({
@@ -18,8 +20,10 @@ export default function FloatComponent({
   disabled,
   editNode = false,
   id = "",
+  nodeId,
   showParameter = true,
 }: InputProps<number, FloatComponentType>): JSX.Element | null {
+  const { t } = useTranslation();
   const step = rangeSpec?.step ?? 0.1;
   const min = rangeSpec?.min;
   const max = rangeSpec?.max;
@@ -91,7 +95,7 @@ export default function FloatComponent({
   return (
     <div className="w-full">
       <NumberInput
-        id={id}
+        id={getNodeScopedDomId(id, nodeId)}
         step={step}
         min={min}
         max={max}
@@ -105,7 +109,9 @@ export default function FloatComponent({
           onKeyDown={(event) => handleKeyDown(event, localValue, "")}
           onInput={handleInputChange}
           disabled={disabled}
-          placeholder={editNode ? "Float number" : "Type a float number"}
+          placeholder={
+            editNode ? t("input.floatNumberShort") : t("input.floatNumberFull")
+          }
           data-testid={id}
           ref={inputRef}
           onBlur={handleBlur}

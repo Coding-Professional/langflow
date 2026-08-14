@@ -1,7 +1,10 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from langflow.api.utils.core import extract_global_variables_from_headers
 from langflow.api.v1 import mcp_utils
+from langflow.helpers import flow as flow_helpers
 from lfx.interface.components import component_cache
 
 
@@ -137,6 +140,83 @@ async def test_handle_list_tools_skips_blocked_custom_flows(monkeypatch):
         mcp_utils.current_user_ctx.reset(token)
 
     assert tools == []
+
+
+class TestExtractGlobalVariablesFromHeaders:
+    """Unit tests for ``extract_global_variables_from_headers``.
+
+    Covers the MCP auth-header propagation fix (issue #12529): ``x-api-key``
+    and ``authorization`` should be captured under their lowercase names when
+    (and only when) ``include_auth_headers=True`` is passed. The default
+    behavior must remain backwards-compatible for non-MCP routes, where
+    ``x-api-key`` is Langflow's own auth key and must not leak into the graph
+    context.
+    """
+
+    def test_langflow_global_var_prefix_still_extracted(self):
+        """Regression guard: ``X-LANGFLOW-GLOBAL-VAR-*`` extraction is preserved."""
+        headers = {
+            "X-LANGFLOW-GLOBAL-VAR-API-KEY": "secret-value",
+            "X-LANGFLOW-GLOBAL-VAR-DB-URL": "postgres://host/db",
+            "Content-Type": "application/json",
+        }
+
+        result = extract_global_variables_from_headers(headers)
+
+        assert result == {"API-KEY": "secret-value", "DB-URL": "postgres://host/db"}
+
+    def test_auth_headers_not_extracted_by_default(self):
+        """Non-MCP call sites: ``x-api-key`` / ``authorization`` must not leak through."""
+        headers = {
+            "x-api-key": "langflow-auth-key",
+            "authorization": "Bearer token",
+            "X-LANGFLOW-GLOBAL-VAR-MY-VAR": "value",
+        }
+
+        result = extract_global_variables_from_headers(headers)
+
+        assert "x-api-key" not in result
+        assert "authorization" not in result
+        assert result == {"MY-VAR": "value"}
+
+    def test_auth_headers_extracted_under_lowercase_when_opted_in(self):
+        """MCP call sites: lowercase auth headers are captured when opted in."""
+        headers = {
+            "x-api-key": "api-key-value",
+            "authorization": "Bearer jwt-token",
+        }
+
+        result = extract_global_variables_from_headers(headers, include_auth_headers=True)
+
+        assert result == {"x-api-key": "api-key-value", "authorization": "Bearer jwt-token"}
+
+    def test_auth_header_matching_is_case_insensitive(self):
+        """Headers with mixed or uppercase casing still match (e.g. ``X-Api-Key``, ``AUTHORIZATION``)."""
+        headers = {
+            "X-Api-Key": "mixed-case-value",
+            "AUTHORIZATION": "Bearer UPPER",
+        }
+
+        result = extract_global_variables_from_headers(headers, include_auth_headers=True)
+
+        assert result == {"x-api-key": "mixed-case-value", "authorization": "Bearer UPPER"}
+
+    def test_both_categories_extracted_together(self):
+        """``X-LANGFLOW-GLOBAL-VAR-*`` and auth headers coexist when opted in."""
+        headers = {
+            "X-LANGFLOW-GLOBAL-VAR-API-KEY": "global-secret",
+            "x-api-key": "incoming-mcp-key",
+            "Authorization": "Bearer mcp-token",
+            "Content-Type": "application/json",
+        }
+
+        result = extract_global_variables_from_headers(headers, include_auth_headers=True)
+
+        assert result == {
+            "API-KEY": "global-secret",
+            "x-api-key": "incoming-mcp-key",
+            "authorization": "Bearer mcp-token",
+        }
 
 
 # ============================================================================
@@ -292,3 +372,293 @@ async def test_handle_list_tools_requires_current_user_on_global_server(monkeypa
     # No user context set — must return empty.
     tools = await mcp_utils.handle_list_tools()
     assert tools == []
+
+
+# ============================================================================
+# session_id propagation — MCP clients must be able to persist chat history.
+# ============================================================================
+
+
+def _build_fake_server() -> SimpleNamespace:
+    """Build a minimal MCP server stub with progress notifications disabled."""
+    return SimpleNamespace(
+        request_context=SimpleNamespace(
+            meta=SimpleNamespace(progressToken=None),
+            session=SimpleNamespace(send_progress_notification=AsyncMock()),
+        )
+    )
+
+
+async def _invoke_handle_call_tool(monkeypatch, arguments: dict) -> AsyncMock:
+    """Run handle_call_tool with all external deps stubbed; return the simple_run_flow mock."""
+    # ``user_id`` matches the current user (see ``current_user_ctx`` below) so the
+    # owner-override path in ``ensure_flow_permission`` is exercised; ``workspace_id``
+    # is read by the same guard. ``data`` feeds the HITL support gate.
+    flow = SimpleNamespace(
+        id="flow-id-1",
+        name="my_flow",
+        folder_id=None,
+        user_id="user-1",
+        workspace_id=None,
+        data={"nodes": [], "edges": []},
+    )
+
+    async def fake_get_flow_snake_case(*_args, **_kwargs):
+        return flow
+
+    run_response = SimpleNamespace(outputs=[])
+    simple_run_flow_mock = AsyncMock(return_value=run_response)
+
+    monkeypatch.setattr(mcp_utils, "get_flow_snake_case", fake_get_flow_snake_case)
+    monkeypatch.setattr(mcp_utils, "simple_run_flow", simple_run_flow_mock)
+    monkeypatch.setattr(mcp_utils, "with_db_session", lambda operation: operation(SimpleNamespace()))
+    # Force progress notifications off so the test does not exercise that path.
+    mcp_utils.get_mcp_config().enable_progress_notifications = False
+
+    token = mcp_utils.current_user_ctx.set(SimpleNamespace(id="user-1"))
+    try:
+        await mcp_utils.handle_call_tool(
+            name="my_flow",
+            arguments=arguments,
+            server=_build_fake_server(),
+        )
+    finally:
+        mcp_utils.current_user_ctx.reset(token)
+
+    return simple_run_flow_mock
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_uses_provided_session_id(monkeypatch):
+    """When the MCP client supplies session_id, it must be forwarded to simple_run_flow."""
+    simple_run_flow_mock = await _invoke_handle_call_tool(
+        monkeypatch,
+        arguments={"input_value": "hello", "session_id": "user-1-thread-7"},
+    )
+
+    simple_run_flow_mock.assert_awaited_once()
+    forwarded_request = simple_run_flow_mock.await_args.kwargs["input_request"]
+    assert forwarded_request.session_id == "user-1-thread-7"
+    assert forwarded_request.input_value == "hello"
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_generates_session_id_when_omitted(monkeypatch):
+    """When session_id is absent or blank, a non-empty fallback id must be generated."""
+    from uuid import UUID
+
+    simple_run_flow_mock = await _invoke_handle_call_tool(
+        monkeypatch,
+        arguments={"input_value": "hello"},
+    )
+
+    forwarded_request = simple_run_flow_mock.await_args.kwargs["input_request"]
+    # Fallback must be a valid UUID-shaped string.
+    UUID(forwarded_request.session_id)
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_falls_back_when_session_id_blank(monkeypatch):
+    """Empty-string session_id must trigger the UUID fallback, not pass through."""
+    from uuid import UUID
+
+    simple_run_flow_mock = await _invoke_handle_call_tool(
+        monkeypatch,
+        arguments={"input_value": "hello", "session_id": ""},
+    )
+
+    forwarded_request = simple_run_flow_mock.await_args.kwargs["input_request"]
+    UUID(forwarded_request.session_id)
+    assert forwarded_request.session_id != ""
+
+
+async def test_handle_call_tool_forwards_only_advertised_input_fields(monkeypatch):
+    """Advertised MCP arguments must reach only the input nodes that expose them."""
+
+    class _FakeNode:
+        def __init__(self, node_id, *, is_input, template):
+            self.id = node_id
+            self.is_input = is_input
+            self.data = {"node": {"template": template}}
+
+    class _FakeGraph:
+        def __init__(self):
+            self.vertices = [
+                _FakeNode(
+                    "input-a",
+                    is_input=True,
+                    template={
+                        "input_value": {"show": True, "advanced": False},
+                        "backend_token": {"show": True, "advanced": False},
+                        "enabled": {"show": True, "advanced": False},
+                        "hidden": {"show": False, "advanced": False},
+                        "advanced": {"show": True, "advanced": True},
+                    },
+                ),
+                _FakeNode(
+                    "input-b",
+                    is_input=True,
+                    template={
+                        "backend_token": {"show": True, "advanced": False},
+                        "backend_url": {"show": True, "advanced": False},
+                    },
+                ),
+                _FakeNode(
+                    "downstream",
+                    is_input=False,
+                    template={"backend_url": {"show": True, "advanced": False}},
+                ),
+            ]
+
+        @classmethod
+        def from_payload(cls, _flow_data):
+            return cls()
+
+    import lfx.graph.graph.base as graph_base_module
+
+    monkeypatch.setattr(graph_base_module, "Graph", _FakeGraph)
+
+    simple_run_flow_mock = await _invoke_handle_call_tool(
+        monkeypatch,
+        arguments={
+            "input_value": "test request",
+            "session_id": "thread-1",
+            "backend_token": "example-token",
+            "backend_url": "https://backend.example.com",
+            "enabled": False,
+            "hidden": "must-not-forward",
+            "advanced": "must-not-forward",
+            "unknown": "must-not-forward",
+        },
+    )
+
+    forwarded_request = simple_run_flow_mock.await_args.kwargs["input_request"]
+    assert forwarded_request.input_value == "test request"
+    assert forwarded_request.session_id == "thread-1"
+    assert forwarded_request.tweaks is not None
+    assert forwarded_request.tweaks.root == {
+        "input-a": {"backend_token": "example-token", "enabled": False},
+        "input-b": {
+            "backend_token": "example-token",
+            "backend_url": "https://backend.example.com",
+        },
+    }
+
+
+def test_json_schema_from_flow_includes_optional_session_id(monkeypatch):
+    """json_schema_from_flow must advertise session_id so MCP clients can supply it."""
+
+    class _FakeGraph:
+        def __init__(self):
+            self.vertices = []  # No input nodes — exercises the empty-properties path.
+
+        @classmethod
+        def from_payload(cls, _flow_data):
+            return cls()
+
+    # Patch the lazy import inside json_schema_from_flow.
+    import lfx.graph.graph.base as graph_base_module
+
+    monkeypatch.setattr(graph_base_module, "Graph", _FakeGraph)
+
+    flow = SimpleNamespace(data={"nodes": [], "edges": []})
+    schema = flow_helpers.json_schema_from_flow(flow)
+
+    assert schema["type"] == "object"
+    assert "session_id" in schema["properties"]
+    assert schema["properties"]["session_id"]["type"] == "string"
+    # session_id must be optional so existing MCP clients keep working.
+    assert "session_id" not in schema["required"]
+
+
+def test_json_schema_from_flow_preserves_flow_defined_session_id(monkeypatch):
+    """If a flow already defines a session_id input, do not overwrite it."""
+    custom_session_id_property = {
+        "type": "string",
+        "description": "Flow-defined session id with custom semantics.",
+    }
+
+    class _FakeNode:
+        is_input = True
+        data = {
+            "node": {
+                "template": {
+                    "session_id": {
+                        "show": True,
+                        "advanced": False,
+                        "type": "str",
+                        "info": custom_session_id_property["description"],
+                        "required": True,
+                    }
+                }
+            }
+        }
+
+    class _FakeGraph:
+        def __init__(self):
+            self.vertices = [_FakeNode()]
+
+        @classmethod
+        def from_payload(cls, _flow_data):
+            return cls()
+
+    import lfx.graph.graph.base as graph_base_module
+
+    monkeypatch.setattr(graph_base_module, "Graph", _FakeGraph)
+
+    flow = SimpleNamespace(data={"nodes": [], "edges": []})
+    schema = flow_helpers.json_schema_from_flow(flow)
+
+    # The flow's own definition wins — the reserved injection must not clobber it.
+    assert schema["properties"]["session_id"]["description"] == custom_session_id_property["description"]
+    assert "session_id" in schema["required"]
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_blocks_hitl_flow(monkeypatch):
+    """A HITL flow invoked as an MCP tool must raise so the MCP result is isError, pointing to the v2 API."""
+    hitl_flow = SimpleNamespace(
+        id="flow-hitl",
+        name="HITL Tools",
+        folder_id=None,
+        # Owner of the flow (matches current_user_ctx below) so ensure_flow_permission's
+        # owner-override path passes and the run reaches the HITL support gate.
+        user_id="user-1",
+        workspace_id=None,
+        data={
+            "nodes": [
+                {
+                    "id": "url",
+                    "data": {
+                        "id": "url",
+                        "type": "URLComponent",
+                        "node": {
+                            "template": {
+                                "tools_metadata": {
+                                    "value": [{"name": "fetch", "approval_actions": ["approve", "reject"]}]
+                                }
+                            }
+                        },
+                    },
+                }
+            ],
+            "edges": [],
+        },
+    )
+
+    async def fake_get_flow(*_args, **_kwargs):
+        return hitl_flow
+
+    async def fake_with_db_session(operation):
+        return await operation(object())
+
+    monkeypatch.setattr(mcp_utils, "get_flow_snake_case", fake_get_flow)
+    monkeypatch.setattr(mcp_utils, "with_db_session", fake_with_db_session)
+    monkeypatch.setattr(mcp_utils, "get_mcp_config", lambda: SimpleNamespace(enable_progress_notifications=False))
+
+    token = mcp_utils.current_user_ctx.set(SimpleNamespace(id="user-1"))
+    try:
+        with pytest.raises(RuntimeError, match="Human-in-the-Loop"):
+            await mcp_utils.handle_call_tool("hitl_tools", {"input_value": "hi"}, server=SimpleNamespace())
+    finally:
+        mcp_utils.current_user_ctx.reset(token)
